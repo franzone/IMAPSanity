@@ -2,7 +2,7 @@
 A Python script to add some sanity to my Email Inbox (via IMAP). I find that I get tons of emails from the same sender, but they pile up so quickly that I don't have time to view them all. It's not that I don't want emails from that sender at all, but I don't need all of them. This script will help me to keep the last X messages from a sender, or keep them all. After matching, it moves them to a filtered folder/INBOX so that I can view them there.
 
 ## Configuration
-Configure as many mailboxes as you need to process in the `mailboxes.yml` configuration file. The format is as follows:
+Configure as many mailboxes as you need to process in the `mailboxes.yml` configuration file. You may copy `mailboxes_sample.yml` to `mailboxes.yml` and then modify appropriately. The format is as follows:
 
 ```
 mailboxes:
@@ -32,7 +32,8 @@ python imapsanity.yml john
 
 ### Running Using a Cron Job
 * First clone the repository: git clone https://github.com/franzone/IMAPSanity.git MeSpam
-* Second, modify IMAPSanity/mailboxes.yml appropriately
+* Second, copy IMAPSanity/mailboxes_sample.yml to IMAPSanity/mailboxes.yml
+* Third, modify IMAPSanity/mailboxes.yml appropriately (using your real email)
 * Finally, create a crontab entry to run it:
 ```
 # Runs every 15 minutes
