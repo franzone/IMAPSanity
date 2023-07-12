@@ -1,0 +1,11 @@
+mailboxes:
+  john:
+    email: john.doe@gmail.com
+    password: 123456
+    imap-host: imap.sample.com
+    spam-folder: INBOX.Spam
+  jane:
+    email: jane.doe@gmail.com
+    password: 789101
+    imap-host: imap.sample.com
+    spam-folder: INBOX.Spam
