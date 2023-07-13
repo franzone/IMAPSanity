@@ -25,6 +25,8 @@ class IMAPSanityFiler:
                 if 'ALL' == mailbox or key == mailbox:
                     self.filers_config = self.config[key]['filers']
                     self.matches_config = self.config[key]['matches']
+                    pprint.pprint(self.filers_config)
+                    pprint.pprint(self.matches_config)
                     self.process_mailbox(self.config[key])
         else:
             print('Mailbox {0} Not Found'.format(mailbox))
@@ -32,75 +34,110 @@ class IMAPSanityFiler:
     def process_mailbox(self, mailbox):
         print('Processing mailbox for {0}'.format(mailbox['email']))
         mbox = self.open_inbox(mailbox)
-        counter = 0
         if mbox:
             try:
-                self.open_inbox(mailbox)
-                mbox.select()
-                typ, data = mbox.search(None, 'ALL')
-                totalCount = len(data[0].split())
-                print('Found {0} emails to process'.format(totalCount))
-                emailNum = 0
-                for num in data[0].split():
-                    emailNum = emailNum + 1
+                # First process the INBOX
+                #self.file_inbox_emails(mbox)
 
-                    try:
-                        # Get the message
-                        typ, data = mbox.fetch(num, '(BODY.PEEK[])')
-                        msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
-
-                        # Get JUST the email address and domain
-                        match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
-                        if match is not None:
-                            emailAddr = match.group(0)
-                            emailDomain = match.group(2)
-                            subject = self.strip_non_ascii(msg['Subject'])
-
-                            for i in range(len(self.matches_config)):
-                                cfgSender = None
-                                cfgSubject = None
-                                cfgOperator = None
-                                if 'sender' in self.matches_config[i]:
-                                    cfgSender = self.matches_config[i]['sender']
-                                if 'subject' in self.matches_config[i]:
-                                    cfgSubject = self.matches_config[i]['subject']
-                                if 'operator' in self.matches_config[i]:
-                                    cfgOperator = self.matches_config[i]['operator']
-
-                                if cfgSender is not None and self.email_matches(cfgSender, emailAddr):
-                                    if self.subject_matches(cfgSubject, cfgOperator, subject):
-                                        myFiler = self.filers_config[self.matches_config[i]['filer']]
-                                        if myFiler is not None:
-                                            print('We found a match [{0}] and need to move it to : {1}'.format(emailAddr, myFiler['folder']))
-                                            counter = counter + 1
-
-                                            msgDateTuple = email.utils.parsedate_tz(msg['Date'])
-                                            msgDateTm = email.utils.mktime_tz(msgDateTuple)
-
-                                            # Copy the message to the SPAM folder
-                                            mbox.append(myFiler['folder'], '', imaplib.Time2Internaldate(msgDateTm), str(msg).encode('utf-8'))
-
-                                            # Remove the message from the INBOX
-                                            mbox.store(num, '+FLAGS', '\\Deleted')
-                                            counter = counter + 1
-
-                        if emailNum % 100 == 0:
-                            mbox.expunge()
-
-                    except:
-                        print('Error processing email', sys.exc_info()[0])
-                        print(traceback.format_exc())
-
-                # Expunge the INBOX
-                mbox.expunge()
-
-                print('Moved {0} of {1} emails to the SPAM folder'.format(counter, totalCount))
+                # Now process each of the filers
+                self.process_file_folders(mbox)
 
             except:
                 print('Error processing inbox for {0}: {1}'.format(mailbox['email'], sys.exc_info()[0]))
                 print(traceback.format_exc())
             finally:
-                self.close_inbox(mbox)
+                if mbox is not None:
+                    self.close_inbox(mbox)
+
+    def file_inbox_emails(self, mbox):
+        counter = 0
+        mbox.select()
+        typ, data = mbox.search(None, 'ALL')
+        totalCount = len(data[0].split())
+        print('Found {0} emails to process'.format(totalCount))
+        emailNum = 0
+        for num in data[0].split():
+            emailNum = emailNum + 1
+
+            try:
+                # Get the message
+                typ, data = mbox.fetch(num, '(BODY.PEEK[])')
+                msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
+
+                # Get JUST the email address and domain
+                match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
+                if match is not None:
+                    emailAddr = match.group(0)
+                    emailDomain = match.group(2)
+                    subject = self.strip_non_ascii(msg['Subject'])
+
+                    for i in range(len(self.matches_config)):
+                        cfgSender = None
+                        cfgSubject = None
+                        if 'sender' in self.matches_config[i]:
+                            cfgSender = self.matches_config[i]['sender']
+                        if 'subject' in self.matches_config[i]:
+                            cfgSubject = self.matches_config[i]['subject']
+
+                        if cfgSender is not None and self.email_matches(cfgSender, emailAddr):
+                            if self.subject_matches(cfgSubject, subject):
+                                myFiler = self.filers_config[self.matches_config[i]['filer']]
+                                if myFiler is not None:
+                                    print('We found a match [{0}] and need to move it to : {1}'.format(emailAddr, myFiler['folder']))
+                                    counter = counter + 1
+
+                                    msgDateTuple = email.utils.parsedate_tz(msg['Date'])
+                                    msgDateTm = email.utils.mktime_tz(msgDateTuple)
+
+                                    # Copy the message to the SPAM folder
+                                    mbox.append(myFiler['folder'], '', imaplib.Time2Internaldate(msgDateTm), str(msg).encode('utf-8'))
+
+                                    # Remove the message from the INBOX
+                                    mbox.store(num, '+FLAGS', '\\Deleted')
+                                    counter = counter + 1
+
+                if emailNum % 100 == 0:
+                    mbox.expunge()
+
+            except:
+                print('Error processing email', sys.exc_info()[0])
+                print(traceback.format_exc())
+
+        # Expunge the INBOX
+        mbox.expunge()
+
+        print('Moved {0} of {1} emails to file folders'.format(counter, totalCount))
+
+    def process_file_folders(self, mbox):
+        print('Processing filer folders...')
+        for filerKey, cfg in self.filers_config.items():
+            if filerKey != 'ALL':
+                print('Processing filer : {0}'.format(filerKey))
+                mbox.select(cfg['folder'])
+
+                pprint.pprint(cfg)
+                for i in range(len(self.matches_config)):
+                    if self.matches_config[i]['filer'] == filerKey:
+                        matchCfg = self.matches_config[i]
+
+                        # build an IMAP search
+                        typ, data = self.search_for_match(mbox, matchCfg)
+                        totalCount = len(data[0].split())
+                        print('Found {0} emails to process'.format(totalCount))
+
+    def search_for_match(self, mbox, matchCfg):
+        cfgSender = None
+        cfgSubject = None
+        if 'sender' in matchCfg:
+            cfgSender = matchCfg['sender']
+        if 'subject' in matchCfg:
+            cfgSubject = matchCfg['subject']
+        if cfgSender is not None and cfgSender != '' and cfgSubject is not None and cfgSubject != '':
+            return mbox.search(None, '(FROM "' + cfgSender + '")', '(SUBJECT "' + cfgSubject + '")')
+        elif cfgSender is not None and cfgSender != '':
+            return mbox.search(None, '(FROM "' + cfgSender + '")')
+        else:
+            return mbox.search(None, '(SUBJECT "' + cfgSubject + '")')
 
     def email_matches(self, configEmail, actualEmail):
         if configEmail.startswith('@'):
@@ -110,18 +147,12 @@ class IMAPSanityFiler:
             return True
         return False
 
-    def subject_matches(self, configSubject, configOperator, actualSubject):
+    def subject_matches(self, configSubject, actualSubject):
         if configSubject is None or configSubject == '':
             return True
         if actualSubject is None or actualSubject == '':
             return False
-        if configOperator is None or configOperator == 'equals' and configSubject == actualSubject:
-            return True
-        if configOperator == 'starts' and actualSubject.startswith(configSubject):
-            return True
-        if configOperator == 'ends' and actualSubject.endswith(configSubject):
-            return True
-        if configOperator == 'contains' and configSubject in actualSubject:
+        if configSubject in actualSubject:
             return True
         return False
 
