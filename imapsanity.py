@@ -25,8 +25,8 @@ class IMAPSanityFiler:
                 if 'ALL' == mailbox or key == mailbox:
                     self.filers_config = self.config[key]['filers']
                     self.matches_config = self.config[key]['matches']
-                    pprint.pprint(self.filers_config)
-                    pprint.pprint(self.matches_config)
+                    #pprint.pprint(self.filers_config)
+                    #pprint.pprint(self.matches_config)
                     self.process_mailbox(self.config[key])
         else:
             print('Mailbox {0} Not Found'.format(mailbox))
@@ -50,7 +50,7 @@ class IMAPSanityFiler:
                     self.close_inbox(mbox)
 
     def file_inbox_emails(self, mbox):
-        print('Processing INBOX to file emails...')
+        print('\nProcessing INBOX to file emails...')
         counter = 0
         mbox.select()
         typ, data = mbox.search(None, 'ALL')
@@ -59,6 +59,7 @@ class IMAPSanityFiler:
         emailNum = 0
         for num in data[0].split():
             emailNum = emailNum + 1
+            print('.', end='', flush=True)
 
             try:
                 # Get the message
@@ -84,7 +85,7 @@ class IMAPSanityFiler:
                             if self.subject_matches(cfgSubject, subject):
                                 myFiler = self.filers_config[self.matches_config[i]['filer']]
                                 if myFiler is not None:
-                                    print('We found a match [{0}] and need to move it to : {1}'.format(emailAddr, myFiler['folder']))
+                                    print('\nWe found a match [{0}] and need to move it to : {1}'.format(emailAddr, myFiler['folder']))
                                     counter = counter + 1
 
                                     msgDateTuple = email.utils.parsedate_tz(msg['Date'])
@@ -107,10 +108,10 @@ class IMAPSanityFiler:
         # Expunge the INBOX
         mbox.expunge()
 
-        print('Moved {0} of {1} emails to file folders'.format(counter, totalCount))
+        print('\nMoved {0} of {1} emails to file folders'.format(counter, totalCount))
 
     def process_file_folders(self, mbox):
-        print('Processing filer folders...')
+        print('\nProcessing filer folders...')
         for filerKey, cfg in self.filers_config.items():
             if filerKey != 'ALL':
                 print('Processing filer : {0}'.format(filerKey))
