@@ -52,6 +52,7 @@ class IMAPSanityFiler:
     def file_inbox_emails(self, mbox):
         print('\nProcessing INBOX to file emails...')
         counter = 0
+        exceptionCounter = 0
         mbox.select()
         typ, data = mbox.search(None, 'ALL')
         totalCount = len(data[0].split())
@@ -104,6 +105,10 @@ class IMAPSanityFiler:
             except:
                 print('Error processing email', sys.exc_info()[0])
                 print(traceback.format_exc())
+                exceptionCounter = exceptionCounter + 1
+
+            if exceptionCounter > 10:
+                break
 
         # Expunge the INBOX
         mbox.expunge()
