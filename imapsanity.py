@@ -37,7 +37,7 @@ class IMAPSanityFiler:
         if mbox:
             try:
                 # First process the INBOX
-                #self.file_inbox_emails(mbox)
+                self.file_inbox_emails(mbox)
 
                 # Now process each of the filers
                 self.process_file_folders(mbox)
@@ -50,6 +50,7 @@ class IMAPSanityFiler:
                     self.close_inbox(mbox)
 
     def file_inbox_emails(self, mbox):
+        print('Processing INBOX to file emails...')
         counter = 0
         mbox.select()
         typ, data = mbox.search(None, 'ALL')
@@ -113,33 +114,52 @@ class IMAPSanityFiler:
         for filerKey, cfg in self.filers_config.items():
             if filerKey != 'ALL':
                 print('Processing filer : {0}'.format(filerKey))
-                mbox.select(cfg['folder'])
+                cfgKeep = cfg['keep']
+                if not isinstance(cfgKeep, int):
+                    print('ERROR: Configured value [keep][{0}] is not an integer', cfgKeep)
+                else:
+                    mbox.select(cfg['folder'])
 
-                pprint.pprint(cfg)
-                for i in range(len(self.matches_config)):
-                    if self.matches_config[i]['filer'] == filerKey:
-                        matchCfg = self.matches_config[i]
+                    pprint.pprint(cfg)
+                    for i in range(len(self.matches_config)):
+                        if self.matches_config[i]['filer'] == filerKey:
+                            matchCfg = self.matches_config[i]
 
-                        # build an IMAP search
-                        typ, data = self.search_for_match(mbox, matchCfg)
-                        totalCount = len(data[0].split())
-                        print('Found {0} emails to process'.format(totalCount))
-                        for num in data[0].split():
-                            try:
-                                # Get the message
-                                typ, data = mbox.fetch(num, '(BODY.PEEK[])')
-                                msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
+                            # build an IMAP search
+                            typ, data = self.search_for_match(mbox, matchCfg)
+                            totalCount = len(data[0].split())
+                            print('Found {0} emails to process'.format(totalCount))
+                            counter = 0
+                            for num in data[0].split():
+                                counter = counter + 1
+                                try:
+                                    # Get the message
+                                    typ, data = mbox.fetch(num, '(BODY.PEEK[])')
+                                    msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
 
-                                # Get JUST the email address and domain
-                                match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
-                                emailAddr = msg['From']
-                                if match is not None:
-                                    emailAddr = match.group(0)
+                                    # Get JUST the email address and domain
+                                    match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
+                                    emailAddr = msg['From']
+                                    if match is not None:
+                                        emailAddr = match.group(0)
 
-                                print('{0} - {1} - {2}'.format(msg['Date'], emailAddr, self.strip_non_ascii(msg['Subject'])))
-                            except:
-                                print('Error processing email', sys.exc_info()[0])
-                                print(traceback.format_exc())
+                                    action = 'KEEPING'
+                                    if counter > cfgKeep:
+                                        action = 'DELETING'
+
+                                    print('{0} - {1} - {2} - {3}'.format(action, msg['Date'], emailAddr, self.strip_non_ascii(msg['Subject'])))
+
+                                    # Remove the message from the FILER FOLDER
+                                    if counter > cfgKeep:
+                                        mbox.store(num, '+FLAGS', '\\Deleted')
+
+                                except:
+                                    print('Error processing email', sys.exc_info()[0])
+                                    print(traceback.format_exc())
+
+                            # Expunge for each match configuration
+                            mbox.expunge()
+                            print(' ')
 
     def search_for_match(self, mbox, matchCfg):
         cfgSender = None
