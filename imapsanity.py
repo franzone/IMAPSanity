@@ -89,7 +89,7 @@ class IMAPSanityFiler:
                                     msgDateTuple = email.utils.parsedate_tz(msg['Date'])
                                     msgDateTm = email.utils.mktime_tz(msgDateTuple)
 
-                                    # Copy the message to the SPAM folder
+                                    # Copy the message to the filer folder
                                     mbox.append(myFiler['folder'], '', imaplib.Time2Internaldate(msgDateTm), str(msg).encode('utf-8'))
 
                                     # Remove the message from the INBOX
@@ -124,6 +124,22 @@ class IMAPSanityFiler:
                         typ, data = self.search_for_match(mbox, matchCfg)
                         totalCount = len(data[0].split())
                         print('Found {0} emails to process'.format(totalCount))
+                        for num in data[0].split():
+                            try:
+                                # Get the message
+                                typ, data = mbox.fetch(num, '(BODY.PEEK[])')
+                                msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
+
+                                # Get JUST the email address and domain
+                                match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
+                                emailAddr = msg['From']
+                                if match is not None:
+                                    emailAddr = match.group(0)
+
+                                print('{0} - {1} - {2}'.format(msg['Date'], emailAddr, self.strip_non_ascii(msg['Subject'])))
+                            except:
+                                print('Error processing email', sys.exc_info()[0])
+                                print(traceback.format_exc())
 
     def search_for_match(self, mbox, matchCfg):
         cfgSender = None
@@ -132,12 +148,13 @@ class IMAPSanityFiler:
             cfgSender = matchCfg['sender']
         if 'subject' in matchCfg:
             cfgSubject = matchCfg['subject']
+
         if cfgSender is not None and cfgSender != '' and cfgSubject is not None and cfgSubject != '':
-            return mbox.search(None, '(FROM "' + cfgSender + '")', '(SUBJECT "' + cfgSubject + '")')
+            return mbox.sort('REVERSE DATE', 'UTF-8', '(FROM "' + cfgSender + '")', '(SUBJECT "' + cfgSubject + '")')
         elif cfgSender is not None and cfgSender != '':
-            return mbox.search(None, '(FROM "' + cfgSender + '")')
+            return mbox.sort('REVERSE DATE', 'UTF-8', '(FROM "' + cfgSender + '")')
         else:
-            return mbox.search(None, '(SUBJECT "' + cfgSubject + '")')
+            return mbox.sort('REVERSE DATE', 'UTF-8', '(SUBJECT "' + cfgSubject + '")')
 
     def email_matches(self, configEmail, actualEmail):
         if configEmail.startswith('@'):
