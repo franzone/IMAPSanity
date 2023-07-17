@@ -103,7 +103,7 @@ class IMAPSanityFiler:
                     mbox.expunge()
 
             except:
-                print('Error processing email', sys.exc_info()[0])
+                print('\nError processing email', sys.exc_info()[0])
                 print(traceback.format_exc())
                 exceptionCounter = exceptionCounter + 1
 
