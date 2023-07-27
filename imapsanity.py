@@ -51,69 +51,48 @@ class IMAPSanityFiler:
 
     def file_inbox_emails(self, mbox):
         print('\nProcessing INBOX to file emails...')
-        counter = 0
-        exceptionCounter = 0
         mbox.select()
-        typ, data = mbox.search(None, 'ALL')
-        totalCount = len(data[0].split())
-        print('Found {0} emails to process'.format(totalCount))
-        emailNum = 0
-        for num in data[0].split():
-            emailNum = emailNum + 1
-            print('.', end='', flush=True)
+        for i in range(len(self.matches_config)):
+            matchCfg = self.matches_config[i]
+            filerCfg = self.filers_config[matchCfg['filer']]
+            if filerCfg is not None and 'folder' in filerCfg and filerCfg['folder'] is not None:
+                # build an IMAP search
+                typ, data = self.search_for_match(mbox, matchCfg)
+                totalCount = len(data[0].split())
+                print('Found {0} emails to process'.format(totalCount))
+                counter = 0
+                for num in data[0].split():
+                    try:
+                        # Get the message
+                        typ, data = mbox.fetch(num, '(BODY.PEEK[])')
+                        msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
 
-            try:
-                # Get the message
-                typ, data = mbox.fetch(num, '(BODY.PEEK[])')
-                msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
+                        # Get JUST the email address and domain
+                        match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
+                        emailAddr = msg['From']
+                        if match is not None:
+                            emailAddr = match.group(0)
 
-                # Get JUST the email address and domain
-                match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
-                if match is not None:
-                    emailAddr = match.group(0)
-                    emailDomain = match.group(2)
-                    subject = self.strip_non_ascii(msg['Subject'])
+                        action = 'MOVING'
 
-                    for i in range(len(self.matches_config)):
-                        cfgSender = None
-                        cfgSubject = None
-                        if 'sender' in self.matches_config[i]:
-                            cfgSender = self.matches_config[i]['sender']
-                        if 'subject' in self.matches_config[i]:
-                            cfgSubject = self.matches_config[i]['subject']
+                        msgDateTuple = email.utils.parsedate_tz(msg['Date'])
+                        msgDateTm = email.utils.mktime_tz(msgDateTuple)
 
-                        if cfgSender is not None and self.email_matches(cfgSender, emailAddr):
-                            if self.subject_matches(cfgSubject, subject):
-                                myFiler = self.filers_config[self.matches_config[i]['filer']]
-                                if myFiler is not None:
-                                    print('\nWe found a match [{0}] and need to move it to : {1}'.format(emailAddr, myFiler['folder']))
-                                    counter = counter + 1
+                        # Copy the message to the filer folder
+                        mbox.append(filerCfg['folder'], '', imaplib.Time2Internaldate(msgDateTm), str(msg).encode('utf-8'))
 
-                                    msgDateTuple = email.utils.parsedate_tz(msg['Date'])
-                                    msgDateTm = email.utils.mktime_tz(msgDateTuple)
+                        # Remove the message from the INBOX
+                        mbox.store(num, '+FLAGS', '\\Deleted')
+                        counter = counter + 1
 
-                                    # Copy the message to the filer folder
-                                    mbox.append(myFiler['folder'], '', imaplib.Time2Internaldate(msgDateTm), str(msg).encode('utf-8'))
+                        print('{0} - {1} - {2} - {3}'.format(action, msg['Date'], emailAddr, self.strip_non_ascii(msg['Subject'])))
+                    except:
+                        print('Error processing email', sys.exc_info()[0])
+                        print(traceback.format_exc())
 
-                                    # Remove the message from the INBOX
-                                    mbox.store(num, '+FLAGS', '\\Deleted')
-                                    counter = counter + 1
-
-                if emailNum % 100 == 0:
-                    mbox.expunge()
-
-            except:
-                print('\nError processing email', sys.exc_info()[0])
-                print(traceback.format_exc())
-                exceptionCounter = exceptionCounter + 1
-
-            if exceptionCounter > 10:
-                break
-
-        # Expunge the INBOX
-        mbox.expunge()
-
-        print('\nMoved {0} of {1} emails to file folders'.format(counter, totalCount))
+                # Expunge the INBOX
+                print('Moved {0} emails to {1}'.format(counter, filerCfg['folder']))
+                mbox.expunge()
 
     def process_file_folders(self, mbox):
         print('\nProcessing filer folders...')
