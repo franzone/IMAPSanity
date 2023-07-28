@@ -31,7 +31,7 @@ python imapsanity.yml john
 ```
 
 ### Running Using a Cron Job
-* First clone the repository: git clone https://github.com/franzone/IMAPSanity.git MeSpam
+* First clone the repository: git clone https://github.com/franzone/IMAPSanity.git IMAPSanity
 * Second, copy IMAPSanity/mailboxes_sample.yml to IMAPSanity/mailboxes.yml
 * Third, modify IMAPSanity/mailboxes.yml appropriately (using your real email)
 * Finally, create a crontab entry to run it:
