@@ -16,7 +16,7 @@ class IMAPSanityFiler:
 
     def __init__(self):
         with open('mailboxes.yml', 'r') as stream:
-            self.config = load(stream, Loader=Loader)['mailboxes']
+            self.config = load(stream, Loader=Loader)#['mailboxes']
 
     def run(self, mailbox='ALL'):
         if 'ALL' == mailbox or mailbox in self.config.keys():
@@ -97,7 +97,7 @@ class IMAPSanityFiler:
     def process_file_folders(self, mbox):
         print('\nProcessing filer folders...')
         for filerKey, cfg in self.filers_config.items():
-            if filerKey != 'ALL':
+            if cfg['keepAll'] != True:
                 print('Processing filer : {0}'.format(filerKey))
                 cfgKeep = cfg['keep']
                 if not isinstance(cfgKeep, int):
@@ -179,7 +179,7 @@ class IMAPSanityFiler:
         return False
 
     def open_inbox(self, mailbox):
-        mbox = imaplib.IMAP4(mailbox['imap-host'])
+        mbox = imaplib.IMAP4(mailbox['imapHost'])
         try:
             mbox.login(mailbox['email'], mailbox['password'])
             return mbox

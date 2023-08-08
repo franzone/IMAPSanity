@@ -1,11 +1,41 @@
-mailboxes:
-  john:
-    email: john.doe@gmail.com
-    password: 123456
-    imap-host: imap.sample.com
-    spam-folder: INBOX.Spam
-  jane:
-    email: jane.doe@gmail.com
-    password: 789101
-    imap-host: imap.sample.com
-    spam-folder: INBOX.Spam
+john:
+  email: john.doe@gmail.com
+  password: 123456
+  imapHost: imap.sample.com
+  filers:
+    VIP:
+      keep: 0
+      keepAll: true
+      folder: INBOX.IMAPSanity.VIP
+    AllOfThese:
+      keep: 0
+      keepAll: true
+      folder: INBOX.IMAPSanity.AllOfThese
+    OneOfThese:
+      keep: 1
+      keepAll: false
+      folder: INBOX.IMAPSanity.OneOfThese
+    FiveOfThese:
+      keep: 5
+      keepAll: false
+      folder: INBOX.IMAPSanity.FiveOfThese
+    TenOfThese:
+      keep: 10
+      keepAll: false
+      folder: INBOX.IMAPSanity.TenOfThese
+  matches:
+  - sender: my.wife@not-an-email.com
+    subject: 
+    filer: VIP
+  - sender:
+    subject: Newsletters I Trust
+    filer: FiveOfThese
+  - sender: my.bank.statements@not-an-email.com
+    subject: 
+    filer: AllOfThese
+jane:
+  email: jane.doe@gmail.com
+  password: 789101
+  imapHost: imap.sample.com
+  filers:
+  matches:
