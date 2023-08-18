@@ -51,7 +51,12 @@ class IMAPSanityFiler:
 
     def file_inbox_emails(self, mbox):
         print('\nProcessing INBOX to file emails...')
-        mbox.select()
+        try:
+            mbox.select()
+        except:
+            print('Error processing email', sys.exc_info()[0])
+            print(traceback.format_exc())
+            
         for i in range(len(self.matches_config)):
             matchCfg = self.matches_config[i]
             filerCfg = self.filers_config[matchCfg['filer']]
