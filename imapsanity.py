@@ -61,16 +61,32 @@ class IMAPSanityFiler:
             matchCfg = self.matches_config[i]
             filerCfg = self.filers_config[matchCfg['filer']]
             if filerCfg is not None and 'folder' in filerCfg and filerCfg['folder'] is not None:
-                # build an IMAP search
+                # build an IMAP search - now returns UIDs
                 typ, data = self.search_for_match(mbox, matchCfg)
-                totalCount = len(data[0].split())
+                
+                # UIDs are returned as space-separated bytes
+                uid_list = data[0].split()
+                totalCount = len(uid_list)
                 print('Found {0} emails to process'.format(totalCount))
+                
+                if totalCount == 0:
+                    continue
+                
+                # Batch operations for better performance
+                uids_to_move = []
                 counter = 0
-                for num in data[0].split():
+                
+                for uid in uid_list:
                     try:
-                        # Get the message
-                        typ, data = mbox.fetch(num, '(BODY.PEEK[])')
-                        msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
+                        # Fetch only headers (much faster than full message)
+                        typ, data = mbox.uid('FETCH', uid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])')
+                        
+                        if typ != 'OK' or not data or data[0] is None:
+                            continue
+                            
+                        # Parse the header
+                        header_bytes = data[0][1]
+                        msg = email.message_from_bytes(header_bytes, policy=email.policy.default)
 
                         # Get JUST the email address and domain
                         match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
@@ -80,14 +96,7 @@ class IMAPSanityFiler:
 
                         action = 'MOVING'
 
-                        msgDateTuple = email.utils.parsedate_tz(msg['Date'])
-                        msgDateTm = email.utils.mktime_tz(msgDateTuple)
-
-                        # Copy the message to the filer folder
-                        mbox.append(filerCfg['folder'], '', imaplib.Time2Internaldate(msgDateTm), str(msg).encode('utf-8'))
-
-                        # Remove the message from the INBOX
-                        mbox.store(num, '+FLAGS', '\\Deleted')
+                        uids_to_move.append(uid)
                         counter = counter + 1
 
                         print('{0} - {1} - {2} - {3}'.format(action, msg['Date'], emailAddr, self.strip_non_ascii(msg['Subject'])))
@@ -95,9 +104,25 @@ class IMAPSanityFiler:
                         print('Error processing email', sys.exc_info()[0])
                         print(traceback.format_exc())
 
-                # Expunge the INBOX
-                print('Moved {0} emails to {1}'.format(counter, filerCfg['folder']))
-                mbox.expunge()
+                # Batch copy and delete operations
+                if uids_to_move:
+                    try:
+                        # Create comma-separated UID list for batch operations
+                        uid_set = b','.join(uids_to_move)
+                        
+                        # Use COPY instead of APPEND (much faster, preserves metadata)
+                        mbox.uid('COPY', uid_set, filerCfg['folder'])
+                        
+                        # Mark for deletion
+                        mbox.uid('STORE', uid_set, '+FLAGS', '\\Deleted')
+                        
+                        # Expunge to actually delete
+                        mbox.expunge()
+                        
+                        print('Moved {0} emails to {1}'.format(counter, filerCfg['folder']))
+                    except:
+                        print('Error in batch operations', sys.exc_info()[0])
+                        print(traceback.format_exc())
 
     def process_file_folders(self, mbox):
         print('\nProcessing filer folders...')
@@ -115,17 +140,32 @@ class IMAPSanityFiler:
                         if self.matches_config[i]['filer'] == filerKey:
                             matchCfg = self.matches_config[i]
 
-                            # build an IMAP search
+                            # build an IMAP search - now returns UIDs
                             typ, data = self.search_for_match(mbox, matchCfg)
-                            totalCount = len(data[0].split())
+                            
+                            # UIDs are returned as space-separated bytes
+                            uid_list = data[0].split()
+                            totalCount = len(uid_list)
                             print('Found {0} emails to process'.format(totalCount))
+                            
+                            if totalCount == 0:
+                                continue
+                            
                             counter = 0
-                            for num in data[0].split():
+                            uids_to_delete = []
+                            
+                            for uid in uid_list:
                                 counter = counter + 1
                                 try:
-                                    # Get the message
-                                    typ, data = mbox.fetch(num, '(BODY.PEEK[])')
-                                    msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
+                                    # Fetch only headers (much faster than full message)
+                                    typ, data = mbox.uid('FETCH', uid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])')
+                                    
+                                    if typ != 'OK' or not data or data[0] is None:
+                                        continue
+                                        
+                                    # Parse the header
+                                    header_bytes = data[0][1]
+                                    msg = email.message_from_bytes(header_bytes, policy=email.policy.default)
 
                                     # Get JUST the email address and domain
                                     match = re.search(r'([\w\.-]+)(@[\w\.-]+)', msg['From'])
@@ -136,22 +176,36 @@ class IMAPSanityFiler:
                                     action = 'KEEPING'
                                     if counter > cfgKeep:
                                         action = 'DELETING'
+                                        uids_to_delete.append(uid)
 
                                     print('{0} - {1} - {2} - {3}'.format(action, msg['Date'], emailAddr, self.strip_non_ascii(msg['Subject'])))
-
-                                    # Remove the message from the FILER FOLDER
-                                    if counter > cfgKeep:
-                                        mbox.store(num, '+FLAGS', '\\Deleted')
 
                                 except:
                                     print('Error processing email', sys.exc_info()[0])
                                     print(traceback.format_exc())
 
-                            # Expunge for each match configuration
-                            mbox.expunge()
+                            # Batch delete operations
+                            if uids_to_delete:
+                                try:
+                                    # Create comma-separated UID list
+                                    uid_set = b','.join(uids_to_delete)
+                                    
+                                    # Mark for deletion
+                                    mbox.uid('STORE', uid_set, '+FLAGS', '\\Deleted')
+                                    
+                                    # Expunge to actually delete
+                                    mbox.expunge()
+                                except:
+                                    print('Error in batch delete operations', sys.exc_info()[0])
+                                    print(traceback.format_exc())
+                            
                             print(' ')
 
     def search_for_match(self, mbox, matchCfg):
+        """
+        Performs IMAP search using UID SORT for better performance.
+        Returns UIDs instead of sequence numbers for reliability.
+        """
         cfgSender = None
         cfgSubject = None
         if 'sender' in matchCfg:
@@ -159,12 +213,36 @@ class IMAPSanityFiler:
         if 'subject' in matchCfg:
             cfgSubject = matchCfg['subject']
 
-        if cfgSender is not None and cfgSender != '' and cfgSubject is not None and cfgSubject != '':
-            return mbox.sort('REVERSE DATE', 'UTF-8', '(FROM "' + cfgSender + '")', '(SUBJECT "' + cfgSubject + '")')
-        elif cfgSender is not None and cfgSender != '':
-            return mbox.sort('REVERSE DATE', 'UTF-8', '(FROM "' + cfgSender + '")')
-        else:
-            return mbox.sort('REVERSE DATE', 'UTF-8', '(SUBJECT "' + cfgSubject + '")')
+        # Build search criteria
+        search_criteria = []
+        
+        if cfgSender is not None and cfgSender != '':
+            search_criteria.append('(FROM "' + cfgSender + '")')
+        
+        if cfgSubject is not None and cfgSubject != '':
+            search_criteria.append('(SUBJECT "' + cfgSubject + '")')
+        
+        # Combine criteria
+        if len(search_criteria) == 0:
+            # Fallback to ALL if no criteria
+            search_criteria.append('ALL')
+        
+        # Use UID SORT instead of SORT for UIDs
+        try:
+            # Try with multiple criteria
+            if len(search_criteria) > 1:
+                result = mbox.uid('SORT', '(REVERSE DATE)', 'UTF-8', *search_criteria)
+            else:
+                result = mbox.uid('SORT', '(REVERSE DATE)', 'UTF-8', search_criteria[0])
+            return result
+        except:
+            # Fallback to UID SEARCH if SORT is not supported
+            print('SORT not supported, falling back to SEARCH')
+            if len(search_criteria) > 1:
+                result = mbox.uid('SEARCH', None, *search_criteria)
+            else:
+                result = mbox.uid('SEARCH', None, search_criteria[0])
+            return result
 
     def email_matches(self, configEmail, actualEmail):
         if configEmail.startswith('@'):
