@@ -93,10 +93,32 @@ bin/imapsanity purge --older-than 30 --execute   # asks you to type "PURGE <coun
 ```
 Purge only deletes messages imapsanity itself quarantined. Anything you put there by hand is left alone.
 
-### Unattended (cron)
+### Unattended (launchd)
 `cycle` = pull, rules-only plan, apply, pull. It never uses AI and is subject to the same guards and caps.
+Its plans are saved as `cycle-*.json`, so they never replace the manual plan `review`/`apply` pick up.
+
+Use a LaunchAgent, not cron: cron jobs on macOS can't read the login Keychain, so the IMAP password lookup
+(and mbsync's `PassCmd`) fails. `~/Library/LaunchAgents/com.franzone.imapsanity.plist`:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.franzone.imapsanity</string>
+    <key>ProgramArguments</key>
+    <array><string>/Users/YOU/DEV/IMAPSanity/bin/imapsanity</string><string>cycle</string></array>
+    <key>StartInterval</key><integer>900</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>/Users/YOU/.local/state/imapsanity/cron.log</string>
+    <key>StandardErrorPath</key><string>/Users/YOU/.local/state/imapsanity/cron.log</string>
+</dict>
+</plist>
 ```
-*/15 * * * * $HOME/DEV/IMAPSanity/bin/imapsanity cycle >> $HOME/.local/state/imapsanity/cron.log 2>&1
+```
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.franzone.imapsanity.plist   # enable
+launchctl kickstart gui/$(id -u)/com.franzone.imapsanity                                # run now
+launchctl bootout gui/$(id -u)/com.franzone.imapsanity                                  # disable
+tail -f ~/.local/state/imapsanity/cron.log                                              # watch
 ```
 (`./go` runs one cycle by hand.)
 
@@ -114,7 +136,7 @@ Purge only deletes messages imapsanity itself quarantined. Anything you put ther
 * **`circuit breaker tripped` (maildir backend only):** messages vanished locally without a journal entry.
   Nothing was pushed. Find out why before pushing; the last snapshots are in
   `~/.local/state/imapsanity/snapshots/`.
-* **`another imapsanity run is in progress`:** a cron `cycle` is running; wait a minute.
+* **`another imapsanity run is in progress`:** a scheduled `cycle` is running; wait a minute.
 
 ### Where things live
 | Path | What |
