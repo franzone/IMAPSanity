@@ -109,6 +109,8 @@ Use a LaunchAgent, not cron: cron jobs on macOS can't read the login Keychain, s
     <array><string>/Users/YOU/DEV/IMAPSanity/bin/imapsanity</string><string>cycle</string></array>
     <key>StartInterval</key><integer>900</integer>
     <key>ProcessType</key><string>Background</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>PYTHONUNBUFFERED</key><string>1</string></dict>  <!-- keep log lines in order -->
     <key>StandardOutPath</key><string>/Users/YOU/.local/state/imapsanity/cron.log</string>
     <key>StandardErrorPath</key><string>/Users/YOU/.local/state/imapsanity/cron.log</string>
 </dict>
