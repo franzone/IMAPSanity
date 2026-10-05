@@ -97,18 +97,28 @@ def cmd_sync(cfg, idx, args):
 
 
 def cmd_cycle(cfg, idx, args):
-    """Unattended rules-only run (cron): pull, plan without AI, apply, push, pull."""
+    """Unattended rules-only run (cron): pull, plan without AI, apply, push, pull.
+
+    Its plans are saved as cycle-*.json so they never shadow the manual plan that
+    `review` / `apply` pick by default, and empty plans aren't saved at all.
+    """
+    print(f"=== cycle {datetime.now():%Y-%m-%d %H:%M:%S}")
     rc = sync.pull(cfg, idx, True)
     if rc:
         return rc
     actions, _ = rules.build_actions(cfg, idx)
-    path = plan.save(cfg, plan.new_plan(actions))
-    rc = apply.apply_plan(cfg, idx, path, True)
-    if rc == 2:
-        return rc
+    if not actions:
+        print("cycle: no rule matches")
+    else:
+        path = plan.save(cfg, plan.new_plan(actions), prefix="cycle")
+        rc = apply.apply_plan(cfg, idx, path, True)
+        if rc == 2:
+            return rc
     if cfg.maildir_folders:
         rc = sync.push(cfg, True) or rc
-    return sync.pull(cfg, idx, True) or rc
+    if actions or cfg.maildir_folders:
+        rc = sync.pull(cfg, idx, True) or rc
+    return rc
 
 
 def cmd_suggest_rules(cfg, idx, args):

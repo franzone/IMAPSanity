@@ -206,6 +206,16 @@ class TestApplyUndoPurge(Base):
         self.assertEqual(len(self.conn.boxes["INBOX"]), 2)
         self.assertEqual(apply.undo(self.cfg, run, execute=True, out=quiet), 2)  # already undone
 
+    def test_cycle_does_not_shadow_manual_plan(self):
+        from imapsanity import cli
+        manual = plan.save(self.cfg, plan.new_plan([]))
+        self.seed("INBOX", "sale@deals.com", "x")
+        with mock.patch("builtins.print"):
+            cli.cmd_cycle(self.cfg, self.idx, None)
+        self.assertEqual(len(self.conn.boxes["INBOX.IMAPSanity.One"]), 1)
+        self.assertEqual(plan.resolve(self.cfg), manual)
+        self.assertEqual(len(list(plan.plans_dir(self.cfg).glob("cycle-*.json"))), 1)
+
     def test_unapproved_ai_actions_not_applied(self):
         self.seed("INBOX", "news@letters.com", "issue 5")
         self.idx.update(verbose=False)

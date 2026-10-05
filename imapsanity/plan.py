@@ -51,8 +51,9 @@ def plans_dir(cfg):
     return d
 
 
-def save(cfg, plan, path=None):
-    path = Path(path) if path else plans_dir(cfg) / f"plan-{plan['id']}.json"
+def save(cfg, plan, path=None, prefix="plan"):
+    """Manual plans are plan-*.json (what `resolve` picks up); unattended ones use another prefix."""
+    path = Path(path) if path else plans_dir(cfg) / f"{prefix}-{plan['id']}.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(plan, indent=2, ensure_ascii=False))
     tmp.replace(path)
