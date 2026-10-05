@@ -35,17 +35,17 @@ def main():
 email = {q(acct['email'])}
 imap_host = {q(acct['imapHost'])}
 imap_port = 993
-keychain_service = "dreamhost-imap"   # security find-generic-password -a <email> -s <service> -w
+keychain_service = "imap-password"   # security find-generic-password -a <email> -s <service> -w
 imap_prefix = "INBOX."
 imap_delimiter = "."
 
 [paths]
-maildir = "~/Mail/dreamhost"
+maildir = "~/Mail/account"
 state = "~/.local/state/imapsanity"
 
 [mbsync]
-pull = [["/opt/homebrew/bin/mbsync", "dreamhost"]]
-push = []   # only for maildir_folders, e.g. ["/opt/homebrew/bin/mbsync", "--push", "dreamhost-managed"]
+pull = [["/opt/homebrew/bin/mbsync", "account"]]   # your mbsync channel/group name
+push = []   # only for maildir_folders, e.g. ["/opt/homebrew/bin/mbsync", "--push", "account-managed"]
 
 [backends]
 # Folders moved by local file renames + `sync push` (must be in a two-way mbsync channel

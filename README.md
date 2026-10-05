@@ -134,7 +134,7 @@ tail -f ~/.local/state/imapsanity/cron.log                                      
   server; it was skipped. Pull and re-plan.
 * **mbsync: `Unable to recover from UIDVALIDITY change`:** the provider rebuilt that mailbox and mbsync
   refuses to guess. For a pull-only folder, move the local copy out of the synced tree (e.g.
-  `mv ~/Mail/dreamhost/INBOX ~/Mail/dreamhost-INBOX-stale-$(date +%Y%m%d)`) and pull again; it re-downloads.
+  `mv ~/Mail/account/INBOX ~/Mail/account-INBOX-stale-$(date +%Y%m%d)`) and pull again; it re-downloads.
 * **`circuit breaker tripped` (maildir backend only):** messages vanished locally without a journal entry.
   Nothing was pushed. Find out why before pushing; the last snapshots are in
   `~/.local/state/imapsanity/snapshots/`.
