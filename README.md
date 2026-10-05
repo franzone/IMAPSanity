@@ -1,48 +1,95 @@
 # IMAPSanity
-A Python script to add some sanity to my Email Inbox (via IMAP). I find that I get tons of emails from the same sender, but they pile up so quickly that I don't have time to view them all. It's not that I don't want emails from that sender at all, but I don't need all of them. This script will help me to keep the last X messages from a sender, or keep them all. After matching, it moves them to a filtered folder/INBOX so that I can view them there.
+Rules-based (and optionally AI-assisted) cleanup for an IMAP mailbox that is mirrored locally with
+[mbsync](https://isync.sourceforge.io/). Built so that no rule, script or LLM can quietly delete mail.
 
-## Configuration
-Configure as many mailboxes as you need to process in the `mailboxes.yml` configuration file. You may copy `mailboxes_sample.yml` to `mailboxes.yml` and then modify appropriately. The format is as follows:
+Pure Python standard library (3.11+): no notmuch, no afew, no virtualenv, no pip packages.
+
+## How it works
 
 ```
-mailboxes:
-  john:
-    email: john.doe@gmail.com
-    password: 123456
-    imap-host: imap.sample.com
-    spam-folder: INBOX.Spam
-  jane:
-    email: jane.doe@gmail.com
-    password: 789101
-    imap-host: imap.sample.com
-    spam-folder: INBOX.Spam
-```
-\* *Obviously you will need to modify the configuration in `mailboxes.yml` to meet your personal needs (i.e., the configuration of your IMAP mailboxes).*
-
-## Running the Script
-To run all configurations:
-```
-python imapsanity.yml
+mbsync pull ─▶ index ─▶ rules ─┐
+                               ├─▶ plan.json ─▶ review ─▶ apply ─▶ journal ─▶ (push)
+                 ai (optional) ┘                          guards     undo
 ```
 
-To run a specific configuration:
+| Step | What it does |
+|---|---|
+| `index` | Incremental SQLite index of the local maildir (headers only). Ignores messages mbsync marked trashed (`T`). |
+| `plan` | Runs your rules, then (optionally) asks Claude about whatever the rules didn't match. Writes a JSON plan. Changes nothing. |
+| `review` | Approve or reject AI proposals, grouped by sender. Rejections are remembered. |
+| `apply` | The only command that moves mail. Dry run unless `--execute`. |
+| `undo` | Reverses a run from its journal. |
+| `purge` | The only command that deletes mail: old quarantined messages, after you type a confirmation. |
+
+### Safety guarantees
+* **No deletes.** Keep-last-N moves extras to `Quarantine`. Only `purge --execute` deletes, only messages
+  imapsanity itself quarantined, only after N days, only after typing `PURGE <count>`.
+* **AI proposes only.** Claude runs headless (`claude -p`) with every tool disabled, no MCP servers and no
+  settings, in an empty temp dir. Its answer must match a JSON schema whose destinations are your allow
+  list. Every AI proposal starts unapproved. Email content is treated as untrusted (prompt injection can at
+  worst produce a proposal you reject).
+* **Guards on every apply**, whoever wrote the plan: destination allow list, protected source folders
+  (Sent, Drafts…), protected senders (and everyone in the `VIP` filer) can't be quarantined or touched by AI,
+  flagged messages are skipped, per-run caps on moves/quarantines/fraction of a folder (exceeding any
+  aborts the whole run), plans older than 24h are refused, a plan can be applied once.
+* **Exact targeting.** Messages are located on the server by Message-ID; zero or multiple matches are
+  skipped. Requires IMAP `MOVE` + `UIDPLUS`; never issues a bare `EXPUNGE`.
+* **Journal + undo.** Intent is journaled before every move; `imapsanity undo <run>` reverses a run.
+
+### Two backends
+* **IMAP (default):** moves happen on the server with `UID MOVE`; the next mbsync pull mirrors them.
+  mbsync stays pull-only for these folders, so a damaged local maildir can never push a deletion.
+* **Maildir (`[backends].maildir_folders`):** moves are local file renames (mbsync's `,U=` stripped),
+  pushed by `imapsanity sync push`. Before pushing, a circuit breaker verifies that every message that
+  left those folders is explained by the journal, and a hardlink snapshot is taken. Source and destination
+  must both be maildir folders, and they must be in a two-way mbsync channel that is *not* part of the
+  pull group (pull them with `mbsync --pull <channel>`).
+
+## Setup
+1. Config: `cp config.sample.toml config.toml` and edit, or migrate v1 rules:
+   `/usr/bin/python3 tools/migrate_yaml.py mailboxes.yml jonathan > config.toml` (needs PyYAML, once).
+2. Password lives in the macOS Keychain (`[account].keychain_service`, the same item mbsync's `PassCmd`
+   uses), or `IMAPSANITY_PASSWORD`.
+3. `bin/imapsanity check` and create anything missing, e.g. `bin/imapsanity mkfolder Quarantine`.
+
+## Everyday use
 ```
-python imapsanity.yml john
+bin/imapsanity sync pull --execute     # mbsync + index
+bin/imapsanity plan                    # rules + AI proposals
+bin/imapsanity review                  # approve / reject AI proposals
+bin/imapsanity apply                   # dry run
+bin/imapsanity apply --execute
+bin/imapsanity runs                    # journaled runs
+bin/imapsanity undo <run> --execute
+bin/imapsanity suggest-rules           # Claude proposes new [[match]] rules; you paste the ones you like
+bin/imapsanity purge --older-than 30 --execute
 ```
 
-### Running Using a Cron Job
-* First clone the repository: git clone https://github.com/franzone/IMAPSanity.git IMAPSanity
-* Second, copy IMAPSanity/mailboxes_sample.yml to IMAPSanity/mailboxes.yml
-* Third, modify IMAPSanity/mailboxes.yml appropriately (using your real email)
-* Finally, create a crontab entry to run it:
+Unattended (cron), rules only, never AI:
 ```
-# Runs every 15 minutes
-*/15 * * * * cd $HOME/IMAPSanity && python3 imapsanity.py
+*/15 * * * * $HOME/DEV/IMAPSanity/bin/imapsanity cycle >> $HOME/.local/state/imapsanity/cron.log 2>&1
 ```
 
-## Requirements
-* Python >= 3.10
-* IMAP account that allows remote authentication using **email address** and **password**
+## Rules
+```toml
+[filers.OneOfThese]
+folder = "IMAPSanity/OneOfThese"   # local maildir name; "INBOX." prefix and "." delimiter on the server
+keep = 1                           # or "all"
+
+[[match]]
+sender = "@deals.example.com"      # case-insensitive substring of From
+subject = ""                       # case-insensitive substring of Subject
+filer = "OneOfThese"
+```
+Messages in `[rules].source_folders` (default `INBOX`) are filed by the first matching rule. For filers with
+a numeric `keep`, only the newest N messages per rule are kept and the rest go to the quarantine.
+
+## Tests
+```
+/opt/homebrew/bin/python3 -m unittest discover -s tests -t .
+```
+
+The v1 script is kept in `legacy/`.
 
 ## Terms and Conditions
 Download and use of any content (files, scripts, images, etc.) from the repository located at https://github.com/franzone/IMAPSanity construes your consent to these **Terms and Conditions**. Use of this script or any related files is at your own risk. The author, Jonathan Franzone, his family, friends or associates, may not be held liable for any damages, imagined or real, caused by your use of this script or related files.

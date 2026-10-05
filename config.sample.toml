@@ -1,0 +1,91 @@
+# IMAPSanity v2 config (sample; copy to config.toml). Folder names use the local maildir form
+# (e.g. "IMAPSanity/VIP"), mapped to the server as imap_prefix + name with "/" -> delimiter.
+
+[account]
+email = "you@example.com"
+imap_host = "imap.example.com"
+imap_port = 993
+keychain_service = "dreamhost-imap"   # security find-generic-password -a <email> -s <service> -w
+imap_prefix = "INBOX."
+imap_delimiter = "."
+
+[paths]
+maildir = "~/Mail/dreamhost"
+state = "~/.local/state/imapsanity"
+
+[mbsync]
+pull = [["/opt/homebrew/bin/mbsync", "dreamhost"]]
+push = []   # only for maildir_folders, e.g. ["/opt/homebrew/bin/mbsync", "--push", "dreamhost-managed"]
+
+[backends]
+# Folders moved by local file renames + `sync push` (must be in a two-way mbsync channel
+# that is NOT part of the pull group). Everything else is moved server-side over IMAP.
+maildir_folders = []
+
+[rules]
+source_folders = ["INBOX"]
+
+[index]
+exclude = []
+
+[safety]
+quarantine = "Quarantine"
+max_moves_per_run = 200
+max_quarantine_per_run = 100
+max_fraction_per_folder = 0.25
+min_folder_size_for_fraction = 40
+max_plan_age_hours = 24
+skip_flagged = true
+protected_folders = ["Sent", "Sent Messages", "Drafts", "Templates", "Trash", "Deleted Messages"]
+protected_senders = []
+protect_filers = ["VIP"]   # senders matched to these filers are never quarantined or touched by AI
+
+[destinations]
+# Filer folders and the quarantine are added automatically.
+allow = ["Filtered/Newsletters", "Filtered/Social", "Archive/Coupons"]
+
+[ai]
+enabled = true
+command = "claude"
+model = "sonnet"
+folders = ["INBOX"]
+batch_size = 25
+max_messages = 100
+min_confidence = 0.7
+max_budget_usd = 1.0
+instructions = """
+Newsletters and marketing I subscribed to can be filed. Anything from family, clients, banks, or government stays in the inbox.
+"""
+
+[ai.destinations]
+"Filtered/Newsletters" = "newsletters, digests and content subscriptions"
+"Filtered/Social" = "social network notifications"
+"Archive/Coupons" = "coupons, sales and promotional offers"
+"Quarantine" = "obvious junk worth deleting later (cold sales pitches, spam that got through)"
+
+[filers.VIP]
+folder = "IMAPSanity/VIP"
+keep = "all"
+
+[filers.OneOfThese]
+folder = "IMAPSanity/OneOfThese"
+keep = 1
+
+[filers.FiveOfThese]
+folder = "IMAPSanity/FiveOfThese"
+keep = 5
+
+# Matching is a case-insensitive substring of the From header and/or Subject.
+# First matching rule wins. A rule needs a sender, a subject, or both.
+[[match]]
+sender = "spouse@example.com"
+filer = "VIP"
+
+[[match]]
+sender = "@deals.example.com"
+filer = "OneOfThese"
+
+[[match]]
+sender = "news@example.org"
+subject = "weekly digest"
+filer = "FiveOfThese"

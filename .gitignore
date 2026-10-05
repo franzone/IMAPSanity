@@ -167,3 +167,6 @@ mailboxes_backup.yml
 mailboxes-*.yml
 go
 
+
+# IMAPSanity v2 personal config (rules contain personal addresses)
+config.toml
