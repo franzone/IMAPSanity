@@ -52,23 +52,77 @@ mbsync pull ─▶ index ─▶ rules ─┐
    uses), or `IMAPSANITY_PASSWORD`.
 3. `bin/imapsanity check` and create anything missing, e.g. `bin/imapsanity mkfolder Quarantine`.
 
-## Everyday use
+## Day-to-day use
+
+### The daily triage (a few minutes)
 ```
-bin/imapsanity sync pull --execute     # mbsync + index
-bin/imapsanity plan                    # rules + AI proposals
-bin/imapsanity review                  # approve / reject AI proposals
-bin/imapsanity apply                   # dry run
-bin/imapsanity apply --execute
-bin/imapsanity runs                    # journaled runs
-bin/imapsanity undo <run> --execute
-bin/imapsanity suggest-rules           # Claude proposes new [[match]] rules; you paste the ones you like
-bin/imapsanity purge --older-than 30 --execute
+bin/imapsanity sync pull --execute     # 1. fetch new mail (mbsync) and update the index
+bin/imapsanity plan                    # 2. rules file what they can; Claude proposes moves for the rest
+bin/imapsanity review                  # 3. approve / reject the AI proposals, grouped by sender
+bin/imapsanity apply                   # 4. dry run: shows exactly what would move, and anything a guard rejected
+bin/imapsanity apply --execute         # 5. do it (prints the run id to use with undo)
+```
+In `review`, each group shows the destination, sender, up to five subjects and the model's reason:
+`a` approves the whole group, `r` rejects it (remembered, never proposed again), `s` skips it for now,
+`i` decides message by message, `q` saves and quits. Rule-based moves are pre-approved; `bin/imapsanity show`
+lists every action in the latest plan (`--pending` for just the AI proposals awaiting review).
+
+Plans expire after 24 hours and can only be applied once, so if you come back to it later, just re-run `plan`.
+AI classifications are cached by Message-ID, so re-planning doesn't re-bill messages already classified
+(about $0.20 per 100 new ones with Sonnet).
+
+### Undoing something
+```
+bin/imapsanity runs                    # recent runs with what happened in each
+bin/imapsanity undo <run>              # dry run
+bin/imapsanity undo <run> --execute    # moves everything from that run back where it came from
 ```
 
-Unattended (cron), rules only, never AI:
+### Weekly-ish maintenance
+```
+bin/imapsanity suggest-rules           # Claude proposes [[match]] rules for frequent unmatched senders
+```
+Suggestions are written to `~/.local/state/imapsanity/suggested-rules-*.toml` and printed; `config.toml` is never
+changed. Paste the ones you agree with. Every rule you add is one less thing for the AI to guess about
+(and the unattended `cycle` below only uses rules).
+
+Look through `Quarantine` in any mail client. To rescue something, just move it out yourself. When you're happy:
+```
+bin/imapsanity purge --older-than 30             # list what would be deleted
+bin/imapsanity purge --older-than 30 --execute   # asks you to type "PURGE <count>"
+```
+Purge only deletes messages imapsanity itself quarantined. Anything you put there by hand is left alone.
+
+### Unattended (cron)
+`cycle` = pull, rules-only plan, apply, pull. It never uses AI and is subject to the same guards and caps.
 ```
 */15 * * * * $HOME/DEV/IMAPSanity/bin/imapsanity cycle >> $HOME/.local/state/imapsanity/cron.log 2>&1
 ```
+(`./go` runs one cycle by hand.)
+
+### When something stops
+* **`ABORT: ... exceeds max_moves_per_run` (or a fraction/quarantine cap):** nothing was moved. Check the dry run;
+  if it's legitimate (e.g. the first run after adding many rules), re-run with `--max-moves N`,
+  `--max-fraction F` or `--max-quarantine N`.
+* **`rejected: ...` lines:** a guard refused that one action (protected sender, folder not in the allow list…);
+  the rest still apply. Fix `config.toml` if the rejection is wrong.
+* **`not_found` / `ambiguous` after apply:** the message was already moved elsewhere or exists twice on the
+  server; it was skipped. Pull and re-plan.
+* **mbsync: `Unable to recover from UIDVALIDITY change`:** the provider rebuilt that mailbox and mbsync
+  refuses to guess. For a pull-only folder, move the local copy out of the synced tree (e.g.
+  `mv ~/Mail/dreamhost/INBOX ~/Mail/dreamhost-INBOX-stale-$(date +%Y%m%d)`) and pull again; it re-downloads.
+* **`circuit breaker tripped` (maildir backend only):** messages vanished locally without a journal entry.
+  Nothing was pushed. Find out why before pushing; the last snapshots are in
+  `~/.local/state/imapsanity/snapshots/`.
+* **`another imapsanity run is in progress`:** a cron `cycle` is running; wait a minute.
+
+### Where things live
+| Path | What |
+|---|---|
+| `config.toml` | Your account, rules, safety limits and AI settings (gitignored) |
+| `~/.local/state/imapsanity/index.sqlite3` | Index, AI cache and your review decisions (safe to delete; rebuilt on next run, but AI results are re-billed) |
+| `~/.local/state/imapsanity/plans/` | Every plan, as JSON |
+| `~/.local/state/imapsanity/journal/` | One JSONL file per apply/undo/purge run |
 
 ## Rules
 ```toml
@@ -83,6 +137,24 @@ filer = "OneOfThese"
 ```
 Messages in `[rules].source_folders` (default `INBOX`) are filed by the first matching rule. For filers with
 a numeric `keep`, only the newest N messages per rule are kept and the rest go to the quarantine.
+
+## AI settings
+```toml
+[ai]
+enabled = true
+model = "sonnet"
+max_messages = 100        # per plan; the newest unclassified messages first
+min_confidence = 0.7      # lower-confidence proposals are dropped
+instructions = """
+Plain-English preferences, e.g. anything from church, family or my bank stays in the inbox.
+"""
+
+[ai.destinations]         # the only folders the model may propose (each must also be in [destinations].allow)
+"Filtered/Newsletters" = "newsletters, digests and content subscriptions"
+"Quarantine" = "obvious junk worth deleting later"
+```
+The descriptions are shown to the model, so write them the way you'd explain your folders to an assistant.
+Set `enabled = false` (or use `plan --no-ai`) to run rules only.
 
 ## Tests
 ```
