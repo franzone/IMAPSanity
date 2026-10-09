@@ -3,9 +3,9 @@ import os
 import unittest
 from unittest import mock
 
-from imapsanity import ai, apply, guards, journal, maildir, plan, rules, sync
+from imapsanity import ai, apply, guards, journal, maildir, plan, rules, shadow, sync, typesafe
 from imapsanity.backends.imap import ImapBackend
-from imapsanity.config import ConfigError
+from imapsanity.config import ConfigError, load
 from imapsanity.index import Index
 
 from .helpers import Env, FakeIMAP
@@ -306,6 +306,135 @@ class TestAI(Base):
             plan.review(self.cfg, self.idx, path, inp=lambda _: "r", out=quiet)
             self.assertEqual(ai.build_actions(self.cfg, self.idx, exclude=set(), out=quiet), [])
             self.assertEqual(len(sent), 2)  # cached, not re-classified
+
+
+SHADOW_CONFIG = """
+[auto]
+mode = "shadow"
+destinations = ["Filtered/News"]
+
+[typesafe]
+enabled = true
+"""
+
+
+def ts_response(choice, conf, personal=0.0, important=0.0):
+    return {"model": "jev-1.13.0", "usage": {"input_tokens": 300}, "answers": {
+        "destination": {"type": "choice", "choice": choice, "confidence": conf,
+                        "probabilities": {choice: conf}},
+        "personal": {"type": "noul", "noul": personal},
+        "important": {"type": "noul", "noul": important}}}
+
+
+class TestShadow(Base):
+    def setUp(self):
+        super().setUp()
+        self.env.cfg_path.write_text(self.env.cfg_path.read_text() + SHADOW_CONFIG)
+        self.cfg = load(self.env.cfg_path)
+        self.claude = {}      # subject -> (dest, confidence)
+        self.ts = {}          # subject -> response
+        self.ts_sent = []
+        os.environ["TYPESAFE_API_KEY"] = "test-key"
+        self.addCleanup(os.environ.pop, "TYPESAFE_API_KEY", None)
+
+    def fake_claude(self, cfg, system, prompt, schema):
+        items = json.loads(prompt.split("\n", 1)[1])
+        out = [{"id": i["id"], "dest": self.claude[i["subject"]][0], "confidence": self.claude[i["subject"]][1],
+                "reason": "test"} for i in items]
+        return {"items": out}, 0.0
+
+    def fake_post(self, cfg, key, payload):
+        self.assertEqual(key, "test-key")
+        subject = payload["state"]["email"]["subject"]
+        self.ts_sent.append(payload)
+        return self.ts[subject]
+
+    def patched(self):
+        stack = mock.patch("imapsanity.ai.run_claude", self.fake_claude), \
+            mock.patch("imapsanity.typesafe._post", self.fake_post)
+        for m in stack:
+            m.start()
+            self.addCleanup(m.stop)
+
+    def test_config_validation(self):
+        text = self.env.cfg_path.read_text()
+        for bad in ('destinations = ["Quarantine"]', 'destinations = ["Local/Done"]'):
+            self.env.cfg_path.write_text(text.replace('destinations = ["Filtered/News"]', bad))
+            with self.assertRaises(ConfigError):
+                load(self.env.cfg_path)
+        self.env.cfg_path.write_text(text.replace('mode = "shadow"', 'mode = "on"'))
+        with self.assertRaises(ConfigError):
+            load(self.env.cfg_path)
+
+    def test_typesafe_request_shape_and_cache(self):
+        self.patched()
+        self.env.add("INBOX", "news@letters.com", "Issue 1")
+        self.idx.update(verbose=False)
+        self.ts["Issue 1"] = ts_response("Filtered/News", 0.9)
+        rows = ai.candidates(self.cfg, self.idx)
+        self.assertEqual(typesafe.classify(self.cfg, self.idx, rows, 10, out=quiet), 1)
+        self.assertEqual(typesafe.classify(self.cfg, self.idx, rows, 10, out=quiet), 0)  # cached
+        p = self.ts_sent[0]
+        self.assertEqual(set(p["questions"]), {"destination", "personal", "important"})
+        self.assertEqual(list(p["questions"]["destination"]["criteria"]), ["KEEP", "Filtered/News", "Quarantine"])
+        self.assertNotIn("date", p["state"]["email"])
+        self.assertEqual(self.idx.ts_cached(rows[0]["msgid"])["dest"], "Filtered/News")
+
+    def test_typesafe_rejects_unknown_choice(self):
+        self.patched()
+        self.env.add("INBOX", "news@letters.com", "Issue 1")
+        self.idx.update(verbose=False)
+        self.ts["Issue 1"] = ts_response("Sent", 0.9)
+        with self.assertRaises(typesafe.TypeSafeError):
+            typesafe.classify(self.cfg, self.idx, ai.candidates(self.cfg, self.idx), 10, out=quiet)
+
+    def test_cycle_shadow_moves_nothing_and_applies_vetoes(self):
+        self.patched()
+        self.env.add("INBOX", "news@letters.com", "Issue 1")
+        self.env.add("INBOX", "friend@x.com", "lunch?")
+        self.env.add("INBOX", "bank@bank.com", "statement")
+        self.idx.update(verbose=False)
+        self.claude = {"Issue 1": ("Filtered/News", 0.9), "lunch?": ("KEEP", 0.9),
+                       "statement": ("Filtered/News", 0.7)}
+        self.ts = {"Issue 1": ts_response("Filtered/News", 0.95),
+                   "lunch?": ts_response("Filtered/News", 0.95, personal=0.9),     # personal veto
+                   "statement": ts_response("Filtered/News", 0.95, important=0.8)}  # important veto
+        lines = []
+        shadow.run(self.cfg, self.idx, out=lines.append)
+        summary = lines[-1]
+        self.assertIn("claude 1 (Filtered/News 1)", summary)
+        self.assertIn("typesafe 1 (Filtered/News 1)", summary)
+        self.assertIn("both agree 1", summary)
+        self.assertEqual(sorted(p.name for p in (self.env.mail / "INBOX" / "cur").iterdir()).__len__(), 3)
+        self.assertFalse((self.cfg.state_dir / "journal").exists())
+
+    def test_classifier_failure_is_logged_not_raised(self):
+        self.env.add("INBOX", "news@letters.com", "Issue 1")
+        self.idx.update(verbose=False)
+
+        def boom(*a, **k):
+            raise typesafe.TypeSafeError("HTTP 401")
+        with mock.patch("imapsanity.ai.run_claude", side_effect=ai.AIError("no claude")), \
+                mock.patch("imapsanity.typesafe._post", boom):
+            lines = []
+            shadow.run(self.cfg, self.idx, out=lines.append)
+        self.assertTrue(any("claude skipped" in l for l in lines))
+        self.assertTrue(any("typesafe skipped" in l for l in lines))
+
+    def test_report_outcomes(self):
+        self.patched()
+        filed, _ = self.env.add("Filtered/News", "news@letters.com", "Issue 1", days_ago=5)
+        kept, _ = self.env.add("INBOX", "shop@store.com", "Sale", days_ago=5, flags="S")
+        self.idx.update(verbose=False)
+        for msgid in (filed, kept):
+            self.idx.ai_store(msgid, "Filtered/News", 0.9, "test", "sonnet")
+            self.idx.ts_store(msgid, "Filtered/News", 0.9, "{}", 0.0, 0.0, "jev-1.13.0")
+        lines = []
+        shadow.report(self.cfg, self.idx, 30, out=lines.append)
+        text = "\n".join(lines)
+        self.assertIn("2 message(s)", text)
+        self.assertRegex(text, r"now in that folder\s+1\s+1")
+        self.assertRegex(text, r"still in inbox, read\s+1\s+1")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
 
-from . import ai, apply, journal, plan, rules, sync
+from . import ai, apply, journal, plan, rules, shadow, sync, typesafe
 from .backends import BackendError
 from .backends.imap import ImapBackend
 from .config import ConfigError, load
@@ -97,10 +97,12 @@ def cmd_sync(cfg, idx, args):
 
 
 def cmd_cycle(cfg, idx, args):
-    """Unattended rules-only run (cron): pull, plan without AI, apply, push, pull.
+    """Unattended run (launchd): pull, rules-only plan, apply, push, pull.
 
     Its plans are saved as cycle-*.json so they never shadow the manual plan that
     `review` / `apply` pick by default, and empty plans aren't saved at all.
+    With [auto].mode = "shadow" it then classifies new unmatched mail with Claude (and
+    TypeSafe) and logs what would have moved; AI never moves mail here.
     """
     print(f"=== cycle {datetime.now():%Y-%m-%d %H:%M:%S}")
     rc = sync.pull(cfg, idx, True)
@@ -118,7 +120,32 @@ def cmd_cycle(cfg, idx, args):
         rc = sync.push(cfg, True) or rc
     if actions or cfg.maildir_folders:
         rc = sync.pull(cfg, idx, True) or rc
+    if cfg.auto.mode == "shadow":
+        shadow.run(cfg, idx)
     return rc
+
+
+def cmd_shadow_report(cfg, idx, args):
+    return shadow.report(cfg, idx, args.days, show=args.show)
+
+
+def cmd_typesafe_backfill(cfg, idx, args):
+    """Ask TypeSafe about messages Claude already classified, so shadow-report has history now."""
+    if not cfg.typesafe.enabled:
+        print("[typesafe].enabled is false")
+        return 2
+    rows = idx.ts_backfill_rows()
+    if not args.execute:
+        n = min(len(rows), args.limit)
+        print(f"would send {n} message(s) to TypeSafe (sender, subject, List-Id, first 500 chars). "
+              f"Re-run with --execute.")
+        return 0
+    try:
+        typesafe.classify(cfg, idx, rows, args.limit)
+    except typesafe.TypeSafeError as e:
+        print(f"typesafe: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_suggest_rules(cfg, idx, args):
@@ -170,6 +197,13 @@ def cmd_check(cfg, idx, args):
         except ai.AIError as e:
             ok = False
             print(f"  ✗ {e}")
+    if cfg.typesafe.enabled:
+        try:
+            models = typesafe.list_models(cfg)
+            print(f"  ✓ typesafe: key works (model {cfg.typesafe.model}; account has {', '.join(models)})")
+        except typesafe.TypeSafeError as e:
+            ok = False
+            print(f"  ✗ typesafe: {e}")
     print("all good" if ok else "problems found")
     return 0 if ok else 1
 
@@ -215,7 +249,15 @@ def build_parser():
     sp.add_argument("direction", choices=["pull", "push"])
     sp.add_argument("--execute", action="store_true")
 
-    sub.add_parser("cycle", help="unattended rules-only run for cron")
+    sub.add_parser("cycle", help="unattended rules-only run for launchd (+ shadow AI if enabled)")
+
+    sp = sub.add_parser("shadow-report", help="compare what Claude and TypeSafe would have auto-moved")
+    sp.add_argument("--days", type=int, default=30)
+    sp.add_argument("--show", type=int, default=15, help="how many disagreements to list")
+
+    sp = sub.add_parser("typesafe-backfill", help="ask TypeSafe about messages Claude already classified")
+    sp.add_argument("--limit", type=int, default=1000)
+    sp.add_argument("--execute", action="store_true")
 
     sp = sub.add_parser("suggest-rules", help="ask Claude to propose [[match]] rules")
     sp.add_argument("--min-count", type=int, default=3)
@@ -230,6 +272,7 @@ COMMANDS = {
     "review": cmd_review, "apply": cmd_apply, "undo": cmd_undo, "runs": cmd_runs,
     "purge": cmd_purge, "sync": cmd_sync, "cycle": cmd_cycle,
     "suggest-rules": cmd_suggest_rules, "mkfolder": cmd_mkfolder,
+    "shadow-report": cmd_shadow_report, "typesafe-backfill": cmd_typesafe_backfill,
 }
 
 

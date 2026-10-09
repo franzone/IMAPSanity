@@ -63,6 +63,24 @@ Newsletters and marketing I subscribed to can be filed. Anything from family, cl
 "Archive/Coupons" = "coupons, sales and promotional offers"
 "Quarantine" = "obvious junk worth deleting later (cold sales pitches, spam that got through)"
 
+[auto]
+# Unattended AI in `cycle`. "shadow" = classify new unmatched mail and log what would move; never moves.
+mode = "off"
+destinations = ["Filtered/Newsletters", "Filtered/Social", "Archive/Coupons"]   # never the quarantine
+min_confidence = 0.85          # Claude's bar
+max_classify_per_run = 30
+settle_days = 2
+
+[typesafe]
+# Second classifier for shadow mode. Sends sender, subject, List-Id and the first 500 body chars
+# to api.typesafe.ai. Key: Keychain (account = [account].email) or TYPESAFE_API_KEY.
+enabled = false
+model = "jev-latest"           # pin e.g. "jev-1.13.0" once you've tuned thresholds
+keychain_service = "typesafe-api"
+min_confidence = 0.8
+max_personal = 0.2
+max_important = 0.2
+
 [filers.VIP]
 folder = "IMAPSanity/VIP"
 keep = "all"

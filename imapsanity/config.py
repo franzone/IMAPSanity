@@ -54,6 +54,30 @@ class AI:
 
 
 @dataclass
+class Auto:
+    """Unattended AI filing in `cycle`. Only "shadow" exists so far: classify and log, move nothing."""
+    mode: str = "off"                 # "off" | "shadow"
+    destinations: list = field(default_factory=list)  # subset of [ai.destinations]; never the quarantine
+    min_confidence: float = 0.85      # bar for Claude's self-reported confidence
+    max_classify_per_run: int = 30    # per classifier, per cycle (cost and time)
+    settle_days: float = 2            # shadow-report: younger messages count as "too new to judge"
+
+
+@dataclass
+class TypeSafe:
+    """Second classifier (TypeSafe Jev), used only by shadow mode and its report."""
+    enabled: bool = False
+    model: str = "jev-latest"
+    url: str = "https://api.typesafe.ai/v1/systemone"
+    keychain_service: str = ""        # security find-generic-password -a <email> -s <service> -w
+    min_confidence: float = 0.8
+    max_personal: float = 0.2         # veto: probability a real person wrote it personally
+    max_important: float = 0.2        # veto: probability it's a bill/security/official notice
+    workers: int = 8
+    timeout_seconds: int = 30
+
+
+@dataclass
 class Filer:
     name: str
     folder: str
@@ -90,6 +114,8 @@ class Config:
     index_exclude: list
     safety: Safety
     ai: AI
+    auto: Auto
+    typesafe: TypeSafe
     filers: dict
     matches: list
 
@@ -130,6 +156,8 @@ def load(path=None):
     account = _section(raw, "account", Account)
     safety = _section(raw, "safety", Safety)
     ai = _section(raw, "ai", AI)
+    auto = _section(raw, "auto", Auto)
+    typesafe = _section(raw, "typesafe", TypeSafe)
 
     paths = raw.get("paths", {})
     mbsync = raw.get("mbsync", {})
@@ -168,6 +196,8 @@ def load(path=None):
         index_exclude=raw.get("index", {}).get("exclude", []),
         safety=safety,
         ai=ai,
+        auto=auto,
+        typesafe=typesafe,
         filers=filers,
         matches=matches,
     )
@@ -191,6 +221,15 @@ def _validate(cfg):
             raise ConfigError(f"{dest!r} is both a protected folder and an allowed destination")
         if not dest.isascii():
             raise ConfigError(f"{dest!r}: non-ASCII folder names are not supported")
+    if cfg.auto.mode not in ("off", "shadow"):
+        raise ConfigError(f"[auto].mode must be \"off\" or \"shadow\", not {cfg.auto.mode!r}")
+    if cfg.auto.mode == "shadow" and not cfg.ai.enabled:
+        raise ConfigError("[auto].mode = \"shadow\" needs [ai].enabled = true")
+    for dest in cfg.auto.destinations:
+        if dest == cfg.safety.quarantine:
+            raise ConfigError("[auto].destinations may not include the quarantine")
+        if dest not in cfg.ai.destinations:
+            raise ConfigError(f"[auto].destinations: {dest!r} is not in [ai.destinations]")
     if cfg.push_command and not cfg.maildir_folders:
         raise ConfigError("[mbsync].push is set but [backends].maildir_folders is empty")
     if not 0 < cfg.safety.max_fraction_per_folder <= 1:
