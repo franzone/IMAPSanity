@@ -140,12 +140,17 @@ def classify(cfg, idx, rows, out=print):
     out(f"ai: done (${total_cost:.4f})")
 
 
-def build_actions(cfg, idx, exclude, out=print):
-    """Unapproved proposals for live, rule-unmatched, unprotected messages in [ai].folders."""
-    rows = [r for r in unmatched(cfg, idx, cfg.ai.folders)
+def candidates(cfg, idx, exclude=()):
+    """Live, rule-unmatched, unprotected, unflagged messages in [ai].folders: what the AI may judge."""
+    return [r for r in unmatched(cfg, idx, cfg.ai.folders)
             if (r["folder"], r["msgid"]) not in exclude
             and not cfg.is_protected_sender(r["from_raw"])
             and not ("F" in r["flags"] and cfg.safety.skip_flagged)]
+
+
+def build_actions(cfg, idx, exclude, out=print):
+    """Unapproved proposals for live, rule-unmatched, unprotected messages in [ai].folders."""
+    rows = candidates(cfg, idx, exclude)
     classify(cfg, idx, rows, out=out)
 
     actions, seen = [], set()
