@@ -98,6 +98,13 @@ Purge only deletes messages imapsanity itself quarantined. Anything you put ther
 move is subject to the same guards and caps.
 Its plans are saved as `cycle-*.json`, so they never replace the manual plan `review`/`apply` pick up.
 
+If the Mac slept, the first cycle back finds a backlog bigger than one run's caps. So the rules step's
+limits scale with the cycles missed since the last run (`[safety] cycle_interval_minutes`), up to
+`max_backlog_scale`, and `max_fraction_per_folder` up to `max_backlog_fraction`. A scale earned this way
+carries over while cycles keep aborting, so a backlog bigger than one run still drains on its own. An abort
+never raises the scale, so a runaway rule on a normal schedule still stops at the normal caps. The
+shadow/live AI step runs even when the rules step aborts.
+
 Use a LaunchAgent, not cron: cron jobs on macOS can't read the login Keychain, so the IMAP password lookup
 (and mbsync's `PassCmd`) fails. `~/Library/LaunchAgents/com.franzone.imapsanity.plist`:
 ```xml

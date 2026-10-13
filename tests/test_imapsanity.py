@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -135,6 +136,18 @@ class TestGuards(Base):
         self.assertFalse(guards.check_plan(self.cfg, frac, {"INBOX": 9}).aborts)  # below min size
 
 
+class TestBacklogLimits(Base):
+    def test_scale_from_gap_capped(self):
+        s = self.cfg.safety
+        s.max_moves_per_run, s.max_quarantine_per_run, s.max_fraction_per_folder = 200, 100, 0.25
+        s.cycle_interval_minutes, s.max_backlog_scale, s.max_backlog_fraction = 15, 5, 0.5
+        self.assertEqual(guards.backlog_limits(self.cfg, 0), (1.0, 200, 0.25, 100))        # first run
+        self.assertEqual(guards.backlog_limits(self.cfg, 15 * 60), (1.0, 200, 0.25, 100))  # on schedule
+        self.assertEqual(guards.backlog_limits(self.cfg, 30 * 60), (2.0, 400, 0.5, 200))
+        self.assertEqual(guards.backlog_limits(self.cfg, 62 * 3600), (5.0, 1000, 0.5, 500))  # weekend asleep
+        self.assertEqual(guards.backlog_limits(self.cfg, 60, carried=3), (3.0, 600, 0.5, 300))
+
+
 class TestImapBackend(Base):
     def fake(self):
         return FakeIMAP({
@@ -215,6 +228,24 @@ class TestApplyUndoPurge(Base):
         self.assertEqual(len(self.conn.boxes["INBOX.IMAPSanity.One"]), 1)
         self.assertEqual(plan.resolve(self.cfg), manual)
         self.assertEqual(len(list(plan.plans_dir(self.cfg).glob("cycle-*.json"))), 1)
+
+    def test_cycle_limits_scale_after_gap_not_after_abort(self):
+        from imapsanity import cli
+        self.cfg.safety.max_moves_per_run = 1
+        self.cfg.safety.min_folder_size_for_fraction = 1000
+        for days in (0, 1, 2):
+            self.seed("INBOX", "sale@deals.com", f"x{days}", days_ago=days)
+        with mock.patch("builtins.print"):
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 2)   # first run: 1x, 3 moves > 1
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 2)   # an abort doesn't raise the scale
+            self.assertEqual(len(self.conn.boxes["INBOX"]), 3)
+            self.idx.set_meta("cycle_last_run", str(time.time() - 30 * 60))  # one cycle missed: 2x
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 2)
+            self.assertAlmostEqual(float(self.idx.get_meta("cycle_backlog_scale")), 2.0, places=3)  # carried
+            self.cfg.safety.max_moves_per_run = 2                             # 2 x 2 = 4 >= 3
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 0)
+        self.assertEqual(len(self.conn.boxes["INBOX"]), 0)
+        self.assertEqual(self.idx.get_meta("cycle_backlog_scale"), "1")
 
     def test_unapproved_ai_actions_not_applied(self):
         self.seed("INBOX", "news@letters.com", "issue 5")
