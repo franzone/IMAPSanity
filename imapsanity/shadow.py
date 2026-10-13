@@ -65,10 +65,13 @@ def run(cfg, idx, out=print):
 
 def live_actions(cfg, idx, rows):
     """Jev's auto picks as approved actions, oldest first, at most [auto].max_moves_per_run.
-    Messages you rejected for that folder in review are skipped; the guards still check each one."""
+    Messages you rejected for that folder in review are skipped; the guards still check each one.
+    So are messages with several copies in their folder: the backends refuse those as ambiguous,
+    and Jev would pick them again every cycle."""
+    copies = Counter((r["folder"], r["msgid"]) for r in rows)
     actions, seen = [], set()
     for r in sorted(rows, key=lambda r: r["date_ts"] or 0):
-        if (r["folder"], r["msgid"]) in seen:
+        if (r["folder"], r["msgid"]) in seen or copies[(r["folder"], r["msgid"])] > 1:
             continue
         seen.add((r["folder"], r["msgid"]))
         t = idx.ts_cached(r["msgid"])

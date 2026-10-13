@@ -4,6 +4,8 @@ Matching keeps v1's IMAP SEARCH semantics: case-insensitive substring of From / 
 Keep-last-N no longer deletes: extras are proposed for the quarantine folder.
 """
 
+from collections import Counter
+
 from .plan import make_action
 
 
@@ -55,6 +57,10 @@ def build_actions(cfg, idx):
         if filer.keep is None:
             continue
         resident = [r for r in idx.live(filer.folder) if r["msgid"]]
+        # A message with several copies counts once and is never trimmed: the backends refuse
+        # to pick a copy (ambiguous), and the same trim would fail again every cycle.
+        copies = Counter(r["msgid"] for r in resident)
+        resident = list({r["msgid"]: r for r in resident}.values())
         arriving = [v for v in incoming.values() if v[2] == filer.folder]
         kept, beyond = set(), {}
         for rule in (m for m in cfg.matches if m.filer == filer.name):
@@ -69,6 +75,9 @@ def build_actions(cfg, idx):
                     beyond.setdefault(ident, (r, is_incoming, rule))
         for ident, (r, is_incoming, rule) in beyond.items():
             if ident in kept or ("F" in r["flags"] and cfg.safety.skip_flagged):
+                continue
+            if not is_incoming and copies[r["msgid"]] > 1:
+                notes.append(f"skip (duplicate Message-ID in {filer.folder}): {r['subject']}")
                 continue
             if cfg.is_protected_sender(r["from_raw"]):
                 notes.append(f"not quarantining protected sender: {r['from_raw']}")
