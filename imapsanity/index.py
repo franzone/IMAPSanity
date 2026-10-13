@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS ai_decisions (
     ts INTEGER,
     PRIMARY KEY (msgid, dest)
 );
+CREATE TABLE IF NOT EXISTS ts_cache (
+    msgid TEXT PRIMARY KEY,
+    dest TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    probabilities TEXT NOT NULL,
+    personal REAL NOT NULL,
+    important REAL NOT NULL,
+    model TEXT,
+    ts INTEGER
+);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -143,6 +153,26 @@ class Index:
         self.db.execute("INSERT OR REPLACE INTO ai_decisions VALUES (?,?,?,?)",
                         (msgid, dest, decision, int(time.time())))
         self.db.commit()
+
+    # --- TypeSafe cache (shadow mode) ----------------------------------------------
+
+    def ts_cached(self, msgid):
+        return self.db.execute("SELECT * FROM ts_cache WHERE msgid=?", (msgid,)).fetchone()
+
+    def ts_store(self, msgid, dest, confidence, probabilities, personal, important, model):
+        self.db.execute("INSERT OR REPLACE INTO ts_cache VALUES (?,?,?,?,?,?,?,?)",
+                        (msgid, dest, confidence, probabilities, personal, important, model, int(time.time())))
+        self.db.commit()
+
+    def ts_backfill_rows(self):
+        """One live row per message Claude classified but TypeSafe hasn't (for typesafe-backfill)."""
+        return self.db.execute(
+            "SELECT m.* FROM messages m JOIN ai_cache c ON c.msgid = m.msgid "
+            "LEFT JOIN ts_cache t ON t.msgid = m.msgid "
+            "WHERE m.trashed = 0 AND t.msgid IS NULL GROUP BY m.msgid ORDER BY m.date_ts DESC").fetchall()
+
+    def live_by_msgid(self, msgid):
+        return self.db.execute("SELECT * FROM messages WHERE msgid=? AND trashed=0", (msgid,)).fetchall()
 
     # --- meta ---------------------------------------------------------------------
 

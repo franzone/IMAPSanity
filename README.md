@@ -94,7 +94,8 @@ bin/imapsanity purge --older-than 30 --execute   # asks you to type "PURGE <coun
 Purge only deletes messages imapsanity itself quarantined. Anything you put there by hand is left alone.
 
 ### Unattended (launchd)
-`cycle` = pull, rules-only plan, apply, pull. It never uses AI and is subject to the same guards and caps.
+`cycle` = pull, rules-only plan, apply, pull. AI never moves mail here (see shadow mode below), and it is subject
+to the same guards and caps.
 Its plans are saved as `cycle-*.json`, so they never replace the manual plan `review`/`apply` pick up.
 
 Use a LaunchAgent, not cron: cron jobs on macOS can't read the login Keychain, so the IMAP password lookup
@@ -124,6 +125,24 @@ tail -f ~/.local/state/imapsanity/cron.log                                      
 ```
 (`./go` runs one cycle by hand.)
 
+### Shadow mode (trying out unattended AI)
+With `[auto] mode = "shadow"`, every `cycle` also classifies up to `max_classify_per_run` new unmatched
+messages with Claude and, if `[typesafe] enabled = true`, with TypeSafe's Jev, then logs what each would
+auto-move. **Nothing moves.** Claude's answers land in the same cache `plan` uses, so they aren't billed twice.
+
+TypeSafe asks three questions per message: which folder (a Choice over KEEP + `[ai.destinations]`), whether
+a real person wrote it personally, and whether it's a bill/security/official notice. Its bar is confidence
+plus both vetoes. Raw probabilities are cached, so changing a threshold re-scores history without new calls.
+```
+security add-generic-password -a you@example.com -s typesafe-api -w     # store the key (prompts for it)
+bin/imapsanity check                                                    # verifies the key
+bin/imapsanity typesafe-backfill --execute     # one-off: TypeSafe on everything Claude already classified
+bin/imapsanity shadow-report                   # compare both against where your mail actually ended up
+```
+The report shows, for each classifier, what it would have moved and where those messages are now: in that
+folder (you or `review` agreed), elsewhere, still in the inbox (read or unread), deleted, or rejected in
+`review`. Then a destination agreement matrix and the messages they disagree on.
+
 ### When something stops
 * **`ABORT: ... exceeds max_moves_per_run` (or a fraction/quarantine cap):** nothing was moved. Check the dry run;
   if it's legitimate (e.g. the first run after adding many rules), re-run with `--max-moves N`,
@@ -144,7 +163,7 @@ tail -f ~/.local/state/imapsanity/cron.log                                      
 | Path | What |
 |---|---|
 | `config.toml` | Your account, rules, safety limits and AI settings (gitignored) |
-| `~/.local/state/imapsanity/index.sqlite3` | Index, AI cache and your review decisions (safe to delete; rebuilt on next run, but AI results are re-billed) |
+| `~/.local/state/imapsanity/index.sqlite3` | Index, AI and TypeSafe caches and your review decisions (safe to delete; rebuilt on next run, but AI results are re-billed) |
 | `~/.local/state/imapsanity/plans/` | Every plan, as JSON |
 | `~/.local/state/imapsanity/journal/` | One JSONL file per apply/undo/purge run |
 
