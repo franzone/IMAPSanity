@@ -55,17 +55,19 @@ class AI:
 
 @dataclass
 class Auto:
-    """Unattended AI filing in `cycle`. Only "shadow" exists so far: classify and log, move nothing."""
-    mode: str = "off"                 # "off" | "shadow"
+    """Unattended AI filing in `cycle`. "shadow": classify and log, move nothing.
+    "live": the same, then move what TypeSafe's Jev picks (Claude stays a shadow for comparison)."""
+    mode: str = "off"                 # "off" | "shadow" | "live"
     destinations: list = field(default_factory=list)  # subset of [ai.destinations]; never the quarantine
     min_confidence: float = 0.85      # bar for Claude's self-reported confidence
     max_classify_per_run: int = 30    # per classifier, per cycle (cost and time)
+    max_moves_per_run: int = 50       # live: Jev moves at most this many per cycle, oldest first
     settle_days: float = 2            # shadow-report: younger messages count as "too new to judge"
 
 
 @dataclass
 class TypeSafe:
-    """Second classifier (TypeSafe Jev), used only by shadow mode and its report."""
+    """Second classifier (TypeSafe Jev): shadow mode and its report, and the mover in live mode."""
     enabled: bool = False
     model: str = "jev-latest"
     url: str = "https://api.typesafe.ai/v1/systemone"
@@ -221,10 +223,12 @@ def _validate(cfg):
             raise ConfigError(f"{dest!r} is both a protected folder and an allowed destination")
         if not dest.isascii():
             raise ConfigError(f"{dest!r}: non-ASCII folder names are not supported")
-    if cfg.auto.mode not in ("off", "shadow"):
-        raise ConfigError(f"[auto].mode must be \"off\" or \"shadow\", not {cfg.auto.mode!r}")
-    if cfg.auto.mode == "shadow" and not cfg.ai.enabled:
-        raise ConfigError("[auto].mode = \"shadow\" needs [ai].enabled = true")
+    if cfg.auto.mode not in ("off", "shadow", "live"):
+        raise ConfigError(f"[auto].mode must be \"off\", \"shadow\" or \"live\", not {cfg.auto.mode!r}")
+    if cfg.auto.mode in ("shadow", "live") and not cfg.ai.enabled:
+        raise ConfigError(f"[auto].mode = \"{cfg.auto.mode}\" needs [ai].enabled = true")
+    if cfg.auto.mode == "live" and not cfg.typesafe.enabled:
+        raise ConfigError("[auto].mode = \"live\" needs [typesafe].enabled = true")
     for dest in cfg.auto.destinations:
         if dest == cfg.safety.quarantine:
             raise ConfigError("[auto].destinations may not include the quarantine")

@@ -1,6 +1,7 @@
 """Shadow mode: during `cycle`, Claude and TypeSafe both judge new unmatched mail and the cycle
 logs what each *would* auto-move. Nothing is moved. `shadow-report` compares the two against
-your review decisions and against where each message ended up.
+your review decisions and against where each message ended up. In live mode, `live_actions`
+turns Jev's picks into pre-approved plan actions; Claude is still only logged.
 
 The auto bar for each classifier lives here (claude_pick / typesafe_pick), applied to cached
 answers, so changing a threshold in config.toml re-scores history without re-asking anyone.
@@ -12,6 +13,7 @@ from datetime import datetime
 
 from . import ai, typesafe
 from .ai import KEEP
+from .plan import make_action
 
 
 def claude_pick(cfg, c):
@@ -29,7 +31,7 @@ def typesafe_pick(cfg, t):
 
 
 def run(cfg, idx, out=print):
-    """The shadow step of `cycle`. Classifier failures are logged, never raised."""
+    """The shadow step of `cycle`; returns the candidate rows. Classifier failures are logged, never raised."""
     rows = ai.candidates(cfg, idx)
     n = cfg.auto.max_classify_per_run
     todo = [r for r in rows if idx.ai_cached(r["msgid"]) is None][:n]
@@ -57,7 +59,26 @@ def run(cfg, idx, out=print):
     line = f"shadow: of {len(rows)} unmatched in {', '.join(cfg.ai.folders)}, would auto-move: claude {fmt(c_moves)}"
     if cfg.typesafe.enabled:
         line += f"; typesafe {fmt(t_moves)}; both agree {agree}"
-    out(line + ". Nothing moved.")
+    out(line + (". Nothing moved." if cfg.auto.mode == "shadow" else "."))
+    return rows
+
+
+def live_actions(cfg, idx, rows):
+    """Jev's auto picks as approved actions, oldest first, at most [auto].max_moves_per_run.
+    Messages you rejected for that folder in review are skipped; the guards still check each one."""
+    actions, seen = [], set()
+    for r in sorted(rows, key=lambda r: r["date_ts"] or 0):
+        if (r["folder"], r["msgid"]) in seen:
+            continue
+        seen.add((r["folder"], r["msgid"]))
+        t = idx.ts_cached(r["msgid"])
+        dest = typesafe_pick(cfg, t)
+        if not dest or idx.ai_decision(r["msgid"], dest) == "rejected":
+            continue
+        why = (f"typesafe {t['model'] or cfg.typesafe.model} {t['confidence']:.2f} "
+               f"(personal {t['personal']:.2f}, important {t['important']:.2f})")
+        actions.append(make_action(r, dest, "ai", why, True, t["confidence"]))
+    return actions[:cfg.auto.max_moves_per_run]
 
 
 # --- report -------------------------------------------------------------------------

@@ -102,7 +102,8 @@ def cmd_cycle(cfg, idx, args):
     Its plans are saved as cycle-*.json so they never shadow the manual plan that
     `review` / `apply` pick by default, and empty plans aren't saved at all.
     With [auto].mode = "shadow" it then classifies new unmatched mail with Claude (and
-    TypeSafe) and logs what would have moved; AI never moves mail here.
+    TypeSafe) and logs what would have moved. With "live", Jev's picks are then moved too,
+    as an auto-*.json plan through the same guards; Claude never moves mail here.
     """
     print(f"=== cycle {datetime.now():%Y-%m-%d %H:%M:%S}")
     rc = sync.pull(cfg, idx, True)
@@ -120,9 +121,25 @@ def cmd_cycle(cfg, idx, args):
         rc = sync.push(cfg, True) or rc
     if actions or cfg.maildir_folders:
         rc = sync.pull(cfg, idx, True) or rc
-    if cfg.auto.mode == "shadow":
-        shadow.run(cfg, idx)
+    if cfg.auto.mode in ("shadow", "live"):
+        rows = shadow.run(cfg, idx)
+        if cfg.auto.mode == "live":
+            rc = _cycle_live(cfg, idx, rows) or rc
     return rc
+
+
+def _cycle_live(cfg, idx, rows):
+    actions = shadow.live_actions(cfg, idx, rows)
+    if not actions:
+        print("live: nothing for jev to move")
+        return 0
+    path = plan.save(cfg, plan.new_plan(actions), prefix="auto")
+    rc = apply.apply_plan(cfg, idx, path, True)
+    if rc == 2:
+        return rc
+    if cfg.maildir_folders:
+        rc = sync.push(cfg, True) or rc
+    return sync.pull(cfg, idx, True) or rc
 
 
 def cmd_shadow_report(cfg, idx, args):
@@ -249,7 +266,7 @@ def build_parser():
     sp.add_argument("direction", choices=["pull", "push"])
     sp.add_argument("--execute", action="store_true")
 
-    sub.add_parser("cycle", help="unattended rules-only run for launchd (+ shadow AI if enabled)")
+    sub.add_parser("cycle", help="unattended rules run for launchd (+ shadow AI, or live Jev moves, if enabled)")
 
     sp = sub.add_parser("shadow-report", help="compare what Claude and TypeSafe would have auto-moved")
     sp.add_argument("--days", type=int, default=30)

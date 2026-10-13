@@ -365,6 +365,12 @@ class TestShadow(Base):
         self.env.cfg_path.write_text(text.replace('mode = "shadow"', 'mode = "on"'))
         with self.assertRaises(ConfigError):
             load(self.env.cfg_path)
+        live = text.replace('mode = "shadow"', 'mode = "live"')
+        self.env.cfg_path.write_text(live)
+        self.assertEqual(load(self.env.cfg_path).auto.mode, "live")
+        self.env.cfg_path.write_text(live.replace("enabled = true", "enabled = false"))
+        with self.assertRaises(ConfigError):
+            load(self.env.cfg_path)
 
     def test_typesafe_request_shape_and_cache(self):
         self.patched()
@@ -407,6 +413,33 @@ class TestShadow(Base):
         self.assertIn("both agree 1", summary)
         self.assertEqual(sorted(p.name for p in (self.env.mail / "INBOX" / "cur").iterdir()).__len__(), 3)
         self.assertFalse((self.cfg.state_dir / "journal").exists())
+
+    def test_live_actions_follow_jev_bar_oldest_first_capped(self):
+        self.patched()
+        self.cfg.auto.mode = "live"
+        self.cfg.auto.max_moves_per_run = 2
+        self.env.add("INBOX", "news@letters.com", "Issue 1", days_ago=3)
+        self.env.add("INBOX", "news@letters.com", "Issue 2", days_ago=2)
+        self.env.add("INBOX", "news@letters.com", "Issue 3", days_ago=1)
+        self.env.add("INBOX", "news@letters.com", "Issue 4", days_ago=4)
+        self.env.add("INBOX", "friend@x.com", "lunch?")
+        self.env.add("INBOX", "shop@store.com", "Sale")
+        self.idx.update(verbose=False)
+        self.claude = {s: ("KEEP", 0.9) for s in ("Issue 1", "Issue 2", "Issue 3", "Issue 4", "lunch?", "Sale")}
+        self.ts = {"Issue 1": ts_response("Filtered/News", 0.95),
+                   "Issue 2": ts_response("Filtered/News", 0.95),
+                   "Issue 3": ts_response("Filtered/News", 0.95),
+                   "Issue 4": ts_response("Filtered/News", 0.95),
+                   "lunch?": ts_response("Filtered/News", 0.95, personal=0.9),
+                   "Sale": ts_response("Filtered/News", 0.5)}                    # below the bar
+        rows = shadow.run(self.cfg, self.idx, out=quiet)
+        issue4 = next(r for r in rows if r["subject"] == "Issue 4")
+        self.idx.record_decision(issue4["msgid"], "Filtered/News", "rejected")
+        actions = shadow.live_actions(self.cfg, self.idx, rows)
+        self.assertEqual([a["subject"] for a in actions], ["Issue 1", "Issue 2"])
+        self.assertTrue(all(a["approved"] and a["source"] == "ai" and a["dest"] == "Filtered/News"
+                            for a in actions))
+        self.assertFalse(guards.check_plan(self.cfg, actions, self.idx.folder_sizes()).rejected)
 
     def test_classifier_failure_is_logged_not_raised(self):
         self.env.add("INBOX", "news@letters.com", "Issue 1")

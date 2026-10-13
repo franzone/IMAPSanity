@@ -65,10 +65,12 @@ Newsletters and marketing I subscribed to can be filed. Anything from family, cl
 
 [auto]
 # Unattended AI in `cycle`. "shadow" = classify new unmatched mail and log what would move; never moves.
+# "live" = the same, then move what TypeSafe's Jev picks (needs [typesafe] enabled).
 mode = "off"
 destinations = ["Filtered/Newsletters", "Filtered/Social", "Archive/Coupons"]   # never the quarantine
 min_confidence = 0.85          # Claude's bar
 max_classify_per_run = 30
+max_moves_per_run = 50         # live: Jev moves at most this many per cycle, oldest first
 settle_days = 2
 
 [typesafe]

@@ -94,8 +94,8 @@ bin/imapsanity purge --older-than 30 --execute   # asks you to type "PURGE <coun
 Purge only deletes messages imapsanity itself quarantined. Anything you put there by hand is left alone.
 
 ### Unattended (launchd)
-`cycle` = pull, rules-only plan, apply, pull. AI never moves mail here (see shadow mode below), and it is subject
-to the same guards and caps.
+`cycle` = pull, rules-only plan, apply, pull. AI moves mail here only in live mode (see below), and every
+move is subject to the same guards and caps.
 Its plans are saved as `cycle-*.json`, so they never replace the manual plan `review`/`apply` pick up.
 
 Use a LaunchAgent, not cron: cron jobs on macOS can't read the login Keychain, so the IMAP password lookup
@@ -142,6 +142,13 @@ bin/imapsanity shadow-report                   # compare both against where your
 The report shows, for each classifier, what it would have moved and where those messages are now: in that
 folder (you or `review` agreed), elsewhere, still in the inbox (read or unread), deleted, or rejected in
 `review`. Then a destination agreement matrix and the messages they disagree on.
+
+### Live mode (Jev files unattended)
+`[auto] mode = "live"` does everything shadow mode does, then moves Jev's picks: messages that clear the
+TypeSafe bar for one of `[auto].destinations`, skipping anything you rejected for that folder in `review`.
+At most `max_moves_per_run` (default 50) move per cycle, oldest first, as an `auto-*.json` plan through the
+usual guards, so a backlog drains over several cycles. Claude is still only logged, for `shadow-report`.
+Each run is journaled; `bin/imapsanity runs` lists them and `undo <run>` reverses one.
 
 ### When something stops
 * **`ABORT: ... exceeds max_moves_per_run` (or a fraction/quarantine cap):** nothing was moved. Check the dry run;
