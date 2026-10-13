@@ -94,9 +94,16 @@ bin/imapsanity purge --older-than 30 --execute   # asks you to type "PURGE <coun
 Purge only deletes messages imapsanity itself quarantined. Anything you put there by hand is left alone.
 
 ### Unattended (launchd)
-`cycle` = pull, rules-only plan, apply, pull. AI never moves mail here (see shadow mode below), and it is subject
-to the same guards and caps.
+`cycle` = pull, rules-only plan, apply, pull. AI moves mail here only in live mode (see below), and every
+move is subject to the same guards and caps.
 Its plans are saved as `cycle-*.json`, so they never replace the manual plan `review`/`apply` pick up.
+
+If the Mac slept, the first cycle back finds a backlog bigger than one run's caps. So the rules step's
+limits scale with the cycles missed since the last run (`[safety] cycle_interval_minutes`), up to
+`max_backlog_scale`, and `max_fraction_per_folder` up to `max_backlog_fraction`. A scale earned this way
+carries over while cycles keep aborting, so a backlog bigger than one run still drains on its own. An abort
+never raises the scale, so a runaway rule on a normal schedule still stops at the normal caps. The
+shadow/live AI step runs even when the rules step aborts.
 
 Use a LaunchAgent, not cron: cron jobs on macOS can't read the login Keychain, so the IMAP password lookup
 (and mbsync's `PassCmd`) fails. `~/Library/LaunchAgents/com.franzone.imapsanity.plist`:
@@ -142,6 +149,13 @@ bin/imapsanity shadow-report                   # compare both against where your
 The report shows, for each classifier, what it would have moved and where those messages are now: in that
 folder (you or `review` agreed), elsewhere, still in the inbox (read or unread), deleted, or rejected in
 `review`. Then a destination agreement matrix and the messages they disagree on.
+
+### Live mode (Jev files unattended)
+`[auto] mode = "live"` does everything shadow mode does, then moves Jev's picks: messages that clear the
+TypeSafe bar for one of `[auto].destinations`, skipping anything you rejected for that folder in `review`.
+At most `max_moves_per_run` (default 50) move per cycle, oldest first, as an `auto-*.json` plan through the
+usual guards, so a backlog drains over several cycles. Claude is still only logged, for `shadow-report`.
+Each run is journaled; `bin/imapsanity runs` lists them and `undo <run>` reverses one.
 
 ### When something stops
 * **`ABORT: ... exceeds max_moves_per_run` (or a fraction/quarantine cap):** nothing was moved. Check the dry run;

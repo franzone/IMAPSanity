@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -135,6 +136,18 @@ class TestGuards(Base):
         self.assertFalse(guards.check_plan(self.cfg, frac, {"INBOX": 9}).aborts)  # below min size
 
 
+class TestBacklogLimits(Base):
+    def test_scale_from_gap_capped(self):
+        s = self.cfg.safety
+        s.max_moves_per_run, s.max_quarantine_per_run, s.max_fraction_per_folder = 200, 100, 0.25
+        s.cycle_interval_minutes, s.max_backlog_scale, s.max_backlog_fraction = 15, 5, 0.5
+        self.assertEqual(guards.backlog_limits(self.cfg, 0), (1.0, 200, 0.25, 100))        # first run
+        self.assertEqual(guards.backlog_limits(self.cfg, 15 * 60), (1.0, 200, 0.25, 100))  # on schedule
+        self.assertEqual(guards.backlog_limits(self.cfg, 30 * 60), (2.0, 400, 0.5, 200))
+        self.assertEqual(guards.backlog_limits(self.cfg, 62 * 3600), (5.0, 1000, 0.5, 500))  # weekend asleep
+        self.assertEqual(guards.backlog_limits(self.cfg, 60, carried=3), (3.0, 600, 0.5, 300))
+
+
 class TestImapBackend(Base):
     def fake(self):
         return FakeIMAP({
@@ -215,6 +228,24 @@ class TestApplyUndoPurge(Base):
         self.assertEqual(len(self.conn.boxes["INBOX.IMAPSanity.One"]), 1)
         self.assertEqual(plan.resolve(self.cfg), manual)
         self.assertEqual(len(list(plan.plans_dir(self.cfg).glob("cycle-*.json"))), 1)
+
+    def test_cycle_limits_scale_after_gap_not_after_abort(self):
+        from imapsanity import cli
+        self.cfg.safety.max_moves_per_run = 1
+        self.cfg.safety.min_folder_size_for_fraction = 1000
+        for days in (0, 1, 2):
+            self.seed("INBOX", "sale@deals.com", f"x{days}", days_ago=days)
+        with mock.patch("builtins.print"):
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 2)   # first run: 1x, 3 moves > 1
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 2)   # an abort doesn't raise the scale
+            self.assertEqual(len(self.conn.boxes["INBOX"]), 3)
+            self.idx.set_meta("cycle_last_run", str(time.time() - 30 * 60))  # one cycle missed: 2x
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 2)
+            self.assertAlmostEqual(float(self.idx.get_meta("cycle_backlog_scale")), 2.0, places=3)  # carried
+            self.cfg.safety.max_moves_per_run = 2                             # 2 x 2 = 4 >= 3
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 0)
+        self.assertEqual(len(self.conn.boxes["INBOX"]), 0)
+        self.assertEqual(self.idx.get_meta("cycle_backlog_scale"), "1")
 
     def test_unapproved_ai_actions_not_applied(self):
         self.seed("INBOX", "news@letters.com", "issue 5")
@@ -365,6 +396,12 @@ class TestShadow(Base):
         self.env.cfg_path.write_text(text.replace('mode = "shadow"', 'mode = "on"'))
         with self.assertRaises(ConfigError):
             load(self.env.cfg_path)
+        live = text.replace('mode = "shadow"', 'mode = "live"')
+        self.env.cfg_path.write_text(live)
+        self.assertEqual(load(self.env.cfg_path).auto.mode, "live")
+        self.env.cfg_path.write_text(live.replace("enabled = true", "enabled = false"))
+        with self.assertRaises(ConfigError):
+            load(self.env.cfg_path)
 
     def test_typesafe_request_shape_and_cache(self):
         self.patched()
@@ -407,6 +444,33 @@ class TestShadow(Base):
         self.assertIn("both agree 1", summary)
         self.assertEqual(sorted(p.name for p in (self.env.mail / "INBOX" / "cur").iterdir()).__len__(), 3)
         self.assertFalse((self.cfg.state_dir / "journal").exists())
+
+    def test_live_actions_follow_jev_bar_oldest_first_capped(self):
+        self.patched()
+        self.cfg.auto.mode = "live"
+        self.cfg.auto.max_moves_per_run = 2
+        self.env.add("INBOX", "news@letters.com", "Issue 1", days_ago=3)
+        self.env.add("INBOX", "news@letters.com", "Issue 2", days_ago=2)
+        self.env.add("INBOX", "news@letters.com", "Issue 3", days_ago=1)
+        self.env.add("INBOX", "news@letters.com", "Issue 4", days_ago=4)
+        self.env.add("INBOX", "friend@x.com", "lunch?")
+        self.env.add("INBOX", "shop@store.com", "Sale")
+        self.idx.update(verbose=False)
+        self.claude = {s: ("KEEP", 0.9) for s in ("Issue 1", "Issue 2", "Issue 3", "Issue 4", "lunch?", "Sale")}
+        self.ts = {"Issue 1": ts_response("Filtered/News", 0.95),
+                   "Issue 2": ts_response("Filtered/News", 0.95),
+                   "Issue 3": ts_response("Filtered/News", 0.95),
+                   "Issue 4": ts_response("Filtered/News", 0.95),
+                   "lunch?": ts_response("Filtered/News", 0.95, personal=0.9),
+                   "Sale": ts_response("Filtered/News", 0.5)}                    # below the bar
+        rows = shadow.run(self.cfg, self.idx, out=quiet)
+        issue4 = next(r for r in rows if r["subject"] == "Issue 4")
+        self.idx.record_decision(issue4["msgid"], "Filtered/News", "rejected")
+        actions = shadow.live_actions(self.cfg, self.idx, rows)
+        self.assertEqual([a["subject"] for a in actions], ["Issue 1", "Issue 2"])
+        self.assertTrue(all(a["approved"] and a["source"] == "ai" and a["dest"] == "Filtered/News"
+                            for a in actions))
+        self.assertFalse(guards.check_plan(self.cfg, actions, self.idx.folder_sizes()).rejected)
 
     def test_classifier_failure_is_logged_not_raised(self):
         self.env.add("INBOX", "news@letters.com", "Issue 1")

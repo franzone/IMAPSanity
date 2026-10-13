@@ -3,11 +3,12 @@
 import argparse
 import fcntl
 import sys
+import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
 
-from . import ai, apply, journal, plan, rules, shadow, sync, typesafe
+from . import ai, apply, guards, journal, plan, rules, shadow, sync, typesafe
 from .backends import BackendError
 from .backends.imap import ImapBackend
 from .config import ConfigError, load
@@ -102,27 +103,59 @@ def cmd_cycle(cfg, idx, args):
     Its plans are saved as cycle-*.json so they never shadow the manual plan that
     `review` / `apply` pick by default, and empty plans aren't saved at all.
     With [auto].mode = "shadow" it then classifies new unmatched mail with Claude (and
-    TypeSafe) and logs what would have moved; AI never moves mail here.
+    TypeSafe) and logs what would have moved. With "live", Jev's picks are then moved too,
+    as an auto-*.json plan through the same guards; Claude never moves mail here.
+    After a gap (the Mac slept), the rules step's limits scale with the cycles missed; see
+    guards.backlog_limits. The AI step runs even if the rules step aborts.
     """
     print(f"=== cycle {datetime.now():%Y-%m-%d %H:%M:%S}")
+    now = time.time()
+    last = float(idx.get_meta("cycle_last_run") or 0)
+    carried = float(idx.get_meta("cycle_backlog_scale") or 1)
+    idx.set_meta("cycle_last_run", str(now))
+    scale, max_moves, max_fraction, max_quarantine = guards.backlog_limits(cfg, now - last if last else 0, carried)
+    if scale > 1:
+        print(f"cycle: backlog after {(now - last) / 3600:.1f}h, limits x{scale:.1f} (moves {max_moves}, "
+              f"quarantine {max_quarantine}, fraction {max_fraction:.2f})")
+
     rc = sync.pull(cfg, idx, True)
     if rc:
         return rc
     actions, _ = rules.build_actions(cfg, idx)
+    aborted = False
     if not actions:
         print("cycle: no rule matches")
     else:
         path = plan.save(cfg, plan.new_plan(actions), prefix="cycle")
-        rc = apply.apply_plan(cfg, idx, path, True)
-        if rc == 2:
-            return rc
+        rc = apply.apply_plan(cfg, idx, path, True, max_moves, max_fraction, max_quarantine)
+        aborted = rc == 2
+    # An abort keeps the scale this backlog earned, for the next cycle; anything else clears it.
+    idx.set_meta("cycle_backlog_scale", str(scale if aborted else 1))
+    if not aborted:
+        if cfg.maildir_folders:
+            rc = sync.push(cfg, True) or rc
+        if actions or cfg.maildir_folders:
+            rc = sync.pull(cfg, idx, True) or rc
+    # The AI step runs even when the rules step aborted, so a blocked backlog doesn't stall it.
+    if cfg.auto.mode in ("shadow", "live"):
+        rows = shadow.run(cfg, idx)
+        if cfg.auto.mode == "live":
+            rc = _cycle_live(cfg, idx, rows) or rc
+    return 2 if aborted else rc
+
+
+def _cycle_live(cfg, idx, rows):
+    actions = shadow.live_actions(cfg, idx, rows)
+    if not actions:
+        print("live: nothing for jev to move")
+        return 0
+    path = plan.save(cfg, plan.new_plan(actions), prefix="auto")
+    rc = apply.apply_plan(cfg, idx, path, True)
+    if rc == 2:
+        return rc
     if cfg.maildir_folders:
         rc = sync.push(cfg, True) or rc
-    if actions or cfg.maildir_folders:
-        rc = sync.pull(cfg, idx, True) or rc
-    if cfg.auto.mode == "shadow":
-        shadow.run(cfg, idx)
-    return rc
+    return sync.pull(cfg, idx, True) or rc
 
 
 def cmd_shadow_report(cfg, idx, args):
@@ -249,7 +282,7 @@ def build_parser():
     sp.add_argument("direction", choices=["pull", "push"])
     sp.add_argument("--execute", action="store_true")
 
-    sub.add_parser("cycle", help="unattended rules-only run for launchd (+ shadow AI if enabled)")
+    sub.add_parser("cycle", help="unattended rules run for launchd (+ shadow AI, or live Jev moves, if enabled)")
 
     sp = sub.add_parser("shadow-report", help="compare what Claude and TypeSafe would have auto-moved")
     sp.add_argument("--days", type=int, default=30)

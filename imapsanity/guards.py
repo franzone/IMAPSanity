@@ -63,3 +63,18 @@ def check_plan(cfg, actions, folder_sizes, max_moves=None, max_fraction=None, ma
             v.aborts.append(f"{n} of {size} messages leaving {folder} exceeds "
                             f"max_fraction_per_folder={max_fraction} (override: --max-fraction)")
     return v
+
+
+def backlog_limits(cfg, gap_seconds, carried=1.0):
+    """Limits for an unattended cycle after `gap_seconds` without one (e.g. the Mac slept).
+
+    The scale is the number of cycle intervals missed, capped at max_backlog_scale, or the scale
+    carried from an earlier cycle that aborted (so a backlog bigger than one run still drains).
+    Aborts never raise the scale themselves: a runaway rule on a normal schedule stays at 1x.
+    Returns (scale, max_moves, max_fraction, max_quarantine).
+    """
+    s = cfg.safety
+    scale = gap_seconds / (s.cycle_interval_minutes * 60) if gap_seconds else 1.0
+    scale = max(1.0, min(s.max_backlog_scale, max(scale, carried)))
+    fraction = max(s.max_fraction_per_folder, min(s.max_backlog_fraction, s.max_fraction_per_folder * scale))
+    return (scale, int(s.max_moves_per_run * scale), fraction, int(s.max_quarantine_per_run * scale))
