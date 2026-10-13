@@ -91,6 +91,15 @@ class TestIndexAndRules(Base):
         self.assertNotIn("untouched", by_subject)
         self.assertTrue(all(a["approved"] for a in actions))
 
+    def test_duplicate_copies_count_once_and_are_not_trimmed(self):
+        self.env.add("IMAPSanity/One", "sale@deals.com", "new", days_ago=0)
+        dup, _ = self.env.add("IMAPSanity/One", "sale@deals.com", "old copy", days_ago=3)
+        self.env.add("IMAPSanity/One", "sale@deals.com", "old copy", days_ago=3, msgid=dup)
+        self.env.add("IMAPSanity/One", "sale@deals.com", "oldest", days_ago=5)
+        actions, notes = self.plan_rules()
+        self.assertEqual([a["subject"] for a in actions], ["oldest"])
+        self.assertTrue(any("duplicate Message-ID in IMAPSanity/One" in n for n in notes))
+
     def test_flagged_and_protected_are_not_trimmed(self):
         self.env.add("IMAPSanity/One", "sale@deals.com", "new", days_ago=0)
         self.env.add("IMAPSanity/One", "sale@deals.com", "flagged", days_ago=3, flags="FS")
@@ -471,6 +480,18 @@ class TestShadow(Base):
         self.assertTrue(all(a["approved"] and a["source"] == "ai" and a["dest"] == "Filtered/News"
                             for a in actions))
         self.assertFalse(guards.check_plan(self.cfg, actions, self.idx.folder_sizes()).rejected)
+
+    def test_live_actions_skip_duplicate_copies(self):
+        self.patched()
+        self.cfg.auto.mode = "live"
+        msgid, _ = self.env.add("INBOX", "news@letters.com", "Issue 1")
+        self.env.add("INBOX", "news@letters.com", "Issue 1", msgid=msgid)   # second copy, same Message-ID
+        self.env.add("INBOX", "news@letters.com", "Issue 2")
+        self.idx.update(verbose=False)
+        self.claude = {"Issue 1": ("KEEP", 0.9), "Issue 2": ("KEEP", 0.9)}
+        self.ts = {"Issue 1": ts_response("Filtered/News", 0.95), "Issue 2": ts_response("Filtered/News", 0.95)}
+        rows = shadow.run(self.cfg, self.idx, out=quiet)
+        self.assertEqual([a["subject"] for a in shadow.live_actions(self.cfg, self.idx, rows)], ["Issue 2"])
 
     def test_classifier_failure_is_logged_not_raised(self):
         self.env.add("INBOX", "news@letters.com", "Issue 1")
