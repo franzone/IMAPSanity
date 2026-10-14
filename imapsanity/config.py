@@ -1,8 +1,10 @@
 """Load and validate config.toml (stdlib tomllib, no third-party dependencies)."""
 
+import copy
 import os
+import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent.parent
@@ -75,6 +77,7 @@ class TypeSafe:
     model: str = "jev-latest"
     url: str = "https://api.typesafe.ai/v1/systemone"
     keychain_service: str = ""        # security find-generic-password -a <email> -s <service> -w
+    keychain_account: str = ""        # Keychain account for the key; default [account].email
     min_confidence: float = 0.8
     max_personal: float = 0.2         # veto: probability a real person wrote it personally
     max_important: float = 0.2        # veto: probability it's a bill/security/official notice
@@ -95,9 +98,10 @@ class Match:
     filer: str
     sender: str = ""
     subject: str = ""
+    scope: str = ""   # account name for an [[account.match]] rule; "" for a shared one
 
     def label(self):
-        parts = [f"match#{self.index}"]
+        parts = [f"{self.scope}:match#{self.index}" if self.scope else f"match#{self.index}"]
         if self.sender:
             parts.append(f"sender~{self.sender}")
         if self.subject:
@@ -108,6 +112,7 @@ class Match:
 @dataclass
 class Config:
     path: Path
+    name: str   # [[account]] name; "" for a single [account] table
     account: Account
     maildir: Path
     state_dir: Path
@@ -146,16 +151,128 @@ def _section(raw, name, cls):
     unknown = set(data) - known
     if unknown:
         raise ConfigError(f"[{name}] unknown keys: {', '.join(sorted(unknown))}")
+    missing = [f.name for f in fields(cls)
+               if f.default is MISSING and f.default_factory is MISSING and f.name not in data]
+    if missing:
+        raise ConfigError(f"[{name}] missing keys: {', '.join(missing)}")
     return cls(**data)
 
 
-def load(path=None):
+# Keys an [[account]] entry may have besides the Account fields and the per-account sections.
+ACCOUNT_PATH_KEYS = {"name", "maildir", "state", "pull", "push", "maildir_folders"}
+# Shared sections an [[account]] entry may override key by key.
+ACCOUNT_SECTIONS = {"safety", "ai", "auto", "typesafe", "rules", "index"}
+ACCOUNT_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+# With [[account]] entries these name one account's mail, so they belong in each entry.
+PER_ACCOUNT_ONLY = [("paths", "maildir"), ("mbsync", "pull"), ("mbsync", "push"), ("backends", "maildir_folders")]
+
+
+def load_all(path=None):
+    """One Config per account. A single [account] table gives one Config named "" that
+    behaves exactly as before; [[account]] entries are each merged over the shared sections."""
     path = Path(path or os.environ.get("IMAPSANITY_CONFIG") or DEFAULT_CONFIG)
     if not path.exists():
         raise ConfigError(f"config not found: {path} (copy config.sample.toml or run tools/migrate_yaml.py)")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
 
+    accounts = raw.get("account")
+    if isinstance(accounts, dict):
+        return [_build(path, raw, "")]
+    if not accounts:
+        raise ConfigError("an [account] section or [[account]] entries are required")
+    for section, key in PER_ACCOUNT_ONLY:
+        if raw.get(section, {}).get(key):
+            raise ConfigError(f"[{section}].{key} can't be shared between [[account]] entries; "
+                              f"set {key} in each entry instead")
+    cfgs, seen = [], set()
+    for entry in accounts:
+        name = entry.get("name", "")
+        if not ACCOUNT_NAME.match(name):
+            raise ConfigError(f"[[account]] name {name!r} must be letters, digits, '-' or '_'")
+        if name in seen:
+            raise ConfigError(f"[[account]] name {name!r} is used twice")
+        seen.add(name)
+        try:
+            cfgs.append(_build(path, _merge_account(raw, entry), name))
+        except ConfigError as e:
+            raise ConfigError(f"[[account]] {name}: {e}") from None
+    _check_separate(cfgs)
+    return cfgs
+
+
+def _check_separate(cfgs):
+    """Accounts must not share (or nest) state or maildir directories, nor pull each other's mail."""
+    def overlap(a, b):
+        return a == b or a in b.parents or b in a.parents
+
+    for i, a in enumerate(cfgs):
+        for cmd in a.pull_commands + [a.push_command]:
+            if len(cfgs) > 1 and ("-a" in cmd or "--all" in cmd):
+                raise ConfigError(f"[[account]] {a.name}: mbsync {' '.join(cmd[1:])!r} syncs every channel, "
+                                  f"including other accounts'; name this account's channel or group")
+        for b in cfgs[i + 1:]:
+            for what in ("state_dir", "maildir"):
+                pa, pb = getattr(a, what).absolute(), getattr(b, what).absolute()
+                if overlap(pa, pb):
+                    raise ConfigError(f"[[account]] {a.name} and {b.name}: {what} {pa} and {pb} overlap")
+            shared = [c for c in a.pull_commands if c in b.pull_commands]
+            if shared or (a.push_command and a.push_command == b.push_command):
+                raise ConfigError(f"[[account]] {a.name} and {b.name} run the same mbsync command; "
+                                  f"give each account its own channel or group")
+
+
+def pick(cfgs, name):
+    for cfg in cfgs:
+        if cfg.name == name:
+            return cfg
+    raise ConfigError(f"no account {name!r} (have: {', '.join(c.name or '(unnamed)' for c in cfgs)})")
+
+
+def load(path=None, account=None):
+    """The Config for one account: the named one, or the only one."""
+    cfgs = load_all(path)
+    if account:
+        return pick(cfgs, account)
+    if len(cfgs) > 1:
+        raise ConfigError(f"several accounts configured; pick one with --account "
+                          f"({', '.join(c.name for c in cfgs)})")
+    return cfgs[0]
+
+
+def _merge_account(raw, entry):
+    """Rewrite one [[account]] entry plus the shared sections into the single-account shape."""
+    name = entry["name"]
+    known = set(Account.__dataclass_fields__) | ACCOUNT_PATH_KEYS | ACCOUNT_SECTIONS | {
+        "destinations", "filers", "match"}
+    unknown = set(entry) - known
+    if unknown:
+        raise ConfigError(f"unknown keys: {', '.join(sorted(unknown))}")
+    if not entry.get("maildir"):
+        raise ConfigError("maildir is required")
+    unknown = set(entry.get("destinations", {})) - {"allow"}
+    if unknown:
+        raise ConfigError(f"[account.destinations] unknown keys: {', '.join(sorted(unknown))}")
+
+    merged = {k: copy.deepcopy(v) for k, v in raw.items() if k not in ("account", "paths", "mbsync", "backends")}
+    merged["account"] = {k: v for k, v in entry.items() if k in Account.__dataclass_fields__}
+    shared_state = raw.get("paths", {}).get("state", "~/.local/state/imapsanity")
+    merged["paths"] = {"maildir": entry["maildir"], "state": entry.get("state") or f"{shared_state}/{name}"}
+    merged["mbsync"] = {"pull": entry.get("pull", []), "push": entry.get("push", [])}
+    merged["backends"] = {"maildir_folders": entry.get("maildir_folders", [])}
+    for section in ACCOUNT_SECTIONS:
+        merged[section] = {**merged.get(section, {}), **entry.get(section, {})}
+    allow = merged.get("destinations", {}).get("allow", [])
+    extra = [d for d in entry.get("destinations", {}).get("allow", []) if d not in allow]
+    merged["destinations"] = {"allow": allow + extra}
+    merged["filers"] = {**merged.get("filers", {}), **entry.get("filers", {})}
+    # Account rules first: first match wins, so they beat the shared ones.
+    merged["match"] = ([dict(m, _scope=name) for m in entry.get("match", [])]
+                       + merged.get("match", []))
+    return merged
+
+
+def _build(path, raw, name):
     if "account" not in raw:
         raise ConfigError("[account] section is required")
     account = _section(raw, "account", Account)
@@ -168,28 +285,33 @@ def load(path=None):
     mbsync = raw.get("mbsync", {})
 
     filers = {}
-    for name, f in raw.get("filers", {}).items():
+    for fname, f in raw.get("filers", {}).items():
         keep = f.get("keep", "all")
         if keep == "all":
             keep = None
         elif not isinstance(keep, int) or keep < 0:
-            raise ConfigError(f"[filers.{name}] keep must be \"all\" or a non-negative integer")
+            raise ConfigError(f"[filers.{fname}] keep must be \"all\" or a non-negative integer")
         if not f.get("folder"):
-            raise ConfigError(f"[filers.{name}] folder is required")
-        filers[name] = Filer(name, f["folder"], keep)
+            raise ConfigError(f"[filers.{fname}] folder is required")
+        filers[fname] = Filer(fname, f["folder"], keep)
 
     matches = []
-    for i, m in enumerate(raw.get("match", []), start=1):
-        mm = Match(i, m.get("filer", ""), (m.get("sender") or "").strip(), (m.get("subject") or "").strip())
+    counters = {}
+    for m in raw.get("match", []):
+        scope = m.get("_scope", "")
+        counters[scope] = i = counters.get(scope, 0) + 1
+        mm = Match(i, m.get("filer", ""), (m.get("sender") or "").strip(), (m.get("subject") or "").strip(), scope)
+        where = f"{scope}: match #{i}" if scope else f"match #{i}"
         if mm.filer not in filers:
-            raise ConfigError(f"match #{i}: unknown filer {mm.filer!r}")
+            raise ConfigError(f"{where}: unknown filer {mm.filer!r}")
         if not mm.sender and not mm.subject:
             # v1 fell back to matching ALL messages here; v2 refuses.
-            raise ConfigError(f"match #{i}: needs a sender or a subject")
+            raise ConfigError(f"{where}: needs a sender or a subject")
         matches.append(mm)
 
     cfg = Config(
         path=path,
+        name=name,
         account=account,
         maildir=Path(os.path.expanduser(paths.get("maildir", "~/Mail"))),
         state_dir=Path(os.path.expanduser(paths.get("state", "~/.local/state/imapsanity"))),

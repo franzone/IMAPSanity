@@ -1,6 +1,7 @@
 # IMAPSanity v2 config (sample; copy to config.toml). Folder names use the local maildir form
 # (e.g. "IMAPSanity/VIP"), mapped to the server as imap_prefix + name with "/" -> delimiter.
 
+# One account. For several, use [[account]] entries instead (see "Several accounts" in the README).
 [account]
 email = "you@example.com"
 imap_host = "imap.example.com"
@@ -82,6 +83,7 @@ settle_days = 2
 enabled = false
 model = "jev-latest"           # pin e.g. "jev-1.13.0" once you've tuned thresholds
 keychain_service = "typesafe-api"
+# keychain_account = "you@example.com"   # Keychain account for the key; default [account].email
 min_confidence = 0.8
 max_personal = 0.2
 max_important = 0.2

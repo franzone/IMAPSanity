@@ -82,7 +82,8 @@ def apply_plan(cfg, idx, path, execute, max_moves=None, max_fraction=None, max_q
     tally = execute_moves(cfg, v.ok, journal.Journal(cfg, run_id), out=out)
     plan["applied_run"] = run_id
     save(cfg, plan, path)
-    out(f"run {run_id}: " + ", ".join(f"{k} {n}" for k, n in tally.items()) + f"   (undo: imapsanity undo {run_id})")
+    undo_id = f"{cfg.name}/{run_id}" if cfg.name else run_id
+    out(f"run {run_id}: " + ", ".join(f"{k} {n}" for k, n in tally.items()) + f"   (undo: imapsanity undo {undo_id})")
     return 0 if set(tally) <= {"moved", "not_found", "flagged"} else 1
 
 

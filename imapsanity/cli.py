@@ -2,8 +2,10 @@
 
 import argparse
 import fcntl
+import os
 import sys
 import time
+import traceback
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
@@ -11,7 +13,7 @@ from datetime import datetime
 from . import ai, apply, guards, journal, plan, rules, shadow, sync, typesafe
 from .backends import BackendError
 from .backends.imap import ImapBackend
-from .config import ConfigError, load
+from .config import ConfigError, load_all, pick
 from .index import Index
 
 
@@ -81,9 +83,10 @@ def cmd_undo(cfg, idx, args):
 
 
 def cmd_runs(cfg, idx, args):
+    prefix = f"{cfg.name}/" if cfg.name else ""
     for run in journal.all_runs(cfg)[-args.last:]:
         states = Counter(e["status"] for e in journal.final_states(journal.read(cfg, run)))
-        print(f"{run:40} " + ", ".join(f"{k} {n}" for k, n in sorted(states.items())))
+        print(f"{prefix + run:40} " + ", ".join(f"{k} {n}" for k, n in sorted(states.items())))
     return 0
 
 
@@ -244,6 +247,8 @@ def cmd_check(cfg, idx, args):
 def build_parser():
     p = argparse.ArgumentParser(prog="imapsanity", description=__doc__)
     p.add_argument("--config", help="path to config.toml")
+    p.add_argument("--account", help="[[account]] name (default: $IMAPSANITY_ACCOUNT, or every account "
+                                     "for commands that run per account)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("check", help="validate config, server folders, claude")
@@ -309,13 +314,32 @@ COMMANDS = {
 }
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
-    try:
-        cfg = load(args.config)
-    except ConfigError as e:
-        print(f"config error: {e}", file=sys.stderr)
-        return 2
+# With several [[account]] entries and no --account, these run once per account; the rest need one.
+PER_ACCOUNT = {"check", "index", "plan", "cycle", "runs", "shadow-report", "suggest-rules"}
+
+
+def select_accounts(cfgs, args):
+    """The accounts this invocation runs against, or a ConfigError saying why none fit."""
+    named = bool(cfgs[0].name)   # [[account]] entries, not a single [account] table
+    # The environment variable only means something to a config with named accounts.
+    name = args.account or (os.environ.get("IMAPSANITY_ACCOUNT") if named else None)
+    if args.cmd == "undo" and "/" in args.run:
+        run_account, args.run = args.run.split("/", 1)
+        if name and name != run_account:
+            raise ConfigError(f"run {run_account}/{args.run} is not in account {name!r}")
+        name = run_account
+    if name:
+        return [pick(cfgs, name)]
+    # purge is the only command that deletes mail, so it always names its account.
+    if args.cmd == "purge" and named:
+        raise ConfigError(f"purge needs --account ({', '.join(c.name for c in cfgs)})")
+    per_account = args.cmd in PER_ACCOUNT or (args.cmd == "sync" and args.direction == "pull")
+    if len(cfgs) > 1 and not per_account:
+        raise ConfigError(f"{args.cmd} needs --account ({', '.join(c.name for c in cfgs)})")
+    return cfgs
+
+
+def run_one(cfg, args):
     with run_lock(cfg):
         idx = Index(cfg)
         try:
@@ -325,3 +349,31 @@ def main(argv=None):
             return 1
         finally:
             idx.close()
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        cfgs = select_accounts(load_all(args.config), args)
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 2
+    if len(cfgs) == 1:
+        return run_one(cfgs[0], args)
+    # One account failing (server down, a manual run holding its lock) doesn't stop the others.
+    rc = 0
+    for cfg in cfgs:
+        print(f"== {cfg.name} ==", flush=True)
+        try:
+            rc = max(rc, run_one(cfg, args) or 0)
+        except SystemExit as e:
+            if isinstance(e.code, str):
+                print(f"{cfg.name}: skipped: {e.code}", file=sys.stderr)
+                rc = max(rc, 1)
+            else:
+                rc = max(rc, e.code or 0)
+        except Exception:
+            print(f"{cfg.name}: error:", file=sys.stderr)
+            traceback.print_exc()
+            rc = max(rc, 1)
+    return rc

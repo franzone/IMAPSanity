@@ -21,11 +21,17 @@ _FLAGS_RE = re.compile(rb"\bFLAGS \(([^)]*)\)")
 _LIST_RE = re.compile(r'^\((?P<flags>[^)]*)\) (?P<delim>"(?:[^"\\]|\\.)*"|NIL) (?P<name>.+)$')
 
 
-def get_password(account):
-    if os.environ.get("IMAPSANITY_PASSWORD"):
-        return os.environ["IMAPSANITY_PASSWORD"]
+def password_env(name=""):
+    """IMAPSANITY_PASSWORD for a single [account]; IMAPSANITY_PASSWORD_<NAME> for an [[account]] entry."""
+    return f"IMAPSANITY_PASSWORD_{name.upper().replace('-', '_')}" if name else "IMAPSANITY_PASSWORD"
+
+
+def get_password(account, name=""):
+    env = password_env(name)
+    if os.environ.get(env):
+        return os.environ[env]
     if not account.keychain_service:
-        raise BackendError("set [account].keychain_service or IMAPSANITY_PASSWORD")
+        raise BackendError(f"set [account].keychain_service or {env}")
     r = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", account.email,
                         "-s", account.keychain_service, "-w"], capture_output=True, text=True)
     if r.returncode != 0:
@@ -51,7 +57,7 @@ class ImapBackend:
         if self.conn is None:
             a = self.cfg.account
             self.conn = imaplib.IMAP4_SSL(a.imap_host, a.imap_port)
-            self.conn.login(a.email, get_password(a))
+            self.conn.login(a.email, get_password(a, self.cfg.name))
         typ, data = self.conn.capability()
         caps = set(b" ".join(data).decode().upper().split())
         missing = {"MOVE", "UIDPLUS"} - caps
