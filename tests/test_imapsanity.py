@@ -1,12 +1,16 @@
+import argparse
+import contextlib
+import fcntl
+import io
 import json
 import os
 import time
 import unittest
 from unittest import mock
 
-from imapsanity import ai, apply, guards, journal, maildir, plan, rules, shadow, sync, typesafe
+from imapsanity import ai, apply, cli, guards, journal, maildir, plan, rules, shadow, sync, typesafe
 from imapsanity.backends.imap import ImapBackend
-from imapsanity.config import ConfigError, load
+from imapsanity.config import ConfigError, load, load_all
 from imapsanity.index import Index
 
 from .helpers import Env, FakeIMAP
@@ -60,6 +64,152 @@ class TestConfig(Base):
     def test_protected_patterns_include_vip_filer(self):
         self.assertIn("mom@family.com", self.cfg.protected_patterns)
         self.assertTrue(self.cfg.is_protected_sender("Boss <BOSS@work.com>"))
+
+    def test_single_account_table_unchanged(self):
+        self.assertEqual(self.cfg.name, "")
+        self.assertEqual(self.cfg.state_dir, self.env.root / "state")
+        self.assertEqual(self.cfg.matches[0].label(), "match#1 sender~mom@family.com -> VIP")
+
+
+MULTI_ACCOUNTS = """
+[[account]]
+name = "personal"
+email = "me@example.com"
+imap_host = "imap.example.com"
+keychain_service = "test"
+maildir = "{root}/Mail"
+pull = [["mbsync", "personal"]]
+
+  [account.safety]
+  max_moves_per_run = 7
+
+  [account.destinations]
+  allow = ["Clients"]
+
+  [account.filers.One]
+  folder = "IMAPSanity/Uno"
+  keep = 2
+
+  [account.filers.Clients]
+  folder = "Clients"
+  keep = "all"
+
+  [[account.match]]
+  sender = "@client.com"
+  filer = "Clients"
+
+[[account]]
+name = "work"
+email = "me@work.com"
+imap_host = "imap.work.com"
+keychain_service = "test"
+maildir = "{root}/Mail2"
+state = "{root}/oldstate"
+
+  [account.ai]
+  enabled = false
+"""
+
+
+class TestMultiAccount(Base):
+    def setUp(self):
+        super().setUp()
+        text = self.env.cfg_path.read_text()
+        shared = text[text.index("[paths]"):]
+        self.env.cfg_path.write_text(shared + MULTI_ACCOUNTS.format(root=self.env.root))
+        self.personal, self.work = load_all(self.env.cfg_path)
+
+    def args(self, *argv):
+        return cli.build_parser().parse_args(argv)
+
+    def test_merge(self):
+        p, w = self.personal, self.work
+        self.assertEqual((p.name, p.account.email, w.account.imap_host), ("personal", "me@example.com", "imap.work.com"))
+        self.assertEqual(p.state_dir, self.env.root / "state" / "personal")
+        self.assertEqual(w.state_dir, self.env.root / "oldstate")
+        self.assertEqual(p.pull_commands, [["mbsync", "personal"]])
+        self.assertEqual(w.pull_commands, [])
+        # Key-by-key section overrides; untouched keys come from the shared section.
+        self.assertEqual((p.safety.max_moves_per_run, w.safety.max_moves_per_run), (7, 50))
+        self.assertEqual(p.safety.protected_senders, ["boss@work.com"])
+        self.assertEqual((p.ai.enabled, w.ai.enabled), (True, False))
+        # Filers: same name replaces, new ones are added; destinations are a union.
+        self.assertEqual(p.filers["One"].folder, "IMAPSanity/Uno")
+        self.assertEqual(w.filers["One"].folder, "IMAPSanity/One")
+        self.assertIn("Clients", p.allow_destinations)
+        self.assertNotIn("Clients", w.allow_destinations)
+        self.assertIn("Filtered/News", p.allow_destinations)
+        # Account rules first, with their own labels; shared labels don't shift.
+        self.assertEqual([m.label() for m in p.matches[:2]],
+                         ["personal:match#1 sender~@client.com -> Clients", "match#1 sender~mom@family.com -> VIP"])
+        self.assertEqual(len(w.matches), 3)
+        self.assertIn("mom@family.com", w.protected_patterns)
+
+    def test_load_needs_account_when_several(self):
+        with self.assertRaises(ConfigError):
+            load(self.env.cfg_path)
+        self.assertEqual(load(self.env.cfg_path, "work").name, "work")
+        with self.assertRaises(ConfigError):
+            load(self.env.cfg_path, "nope")
+
+    def test_bad_account_entries(self):
+        text = self.env.cfg_path.read_text()
+        for bad in (text.replace('name = "work"', 'name = "personal"'),
+                    text.replace('name = "work"', 'name = "../x"'),
+                    text.replace('state = ', 'stat = '),
+                    text.replace('maildir = "{}/Mail2"'.format(self.env.root), '')):
+            self.env.cfg_path.write_text(bad)
+            with self.assertRaises(ConfigError):
+                load_all(self.env.cfg_path)
+
+    def test_select_accounts(self):
+        cfgs = [self.personal, self.work]
+        with mock.patch.dict(os.environ, {"IMAPSANITY_ACCOUNT": ""}):
+            self.assertEqual(len(cli.select_accounts(cfgs, self.args("plan"))), 2)
+            self.assertEqual(len(cli.select_accounts(cfgs, self.args("sync", "pull"))), 2)
+            for argv in (("apply",), ("sync", "push"), ("review",), ("undo", "20260101-000000-apply")):
+                with self.assertRaises(ConfigError):
+                    cli.select_accounts(cfgs, self.args(*argv))
+            # purge names its account even when only one is configured as [[account]].
+            with self.assertRaises(ConfigError):
+                cli.select_accounts(cfgs[:1], self.args("purge", "--older-than", "30"))
+            self.assertEqual(cli.select_accounts(cfgs, self.args("--account", "work", "apply")), [self.work])
+            args = self.args("undo", "work/20260101-000000-apply")
+            self.assertEqual(cli.select_accounts(cfgs, args), [self.work])
+            self.assertEqual(args.run, "20260101-000000-apply")
+            with self.assertRaises(ConfigError):
+                cli.select_accounts(cfgs, self.args("--account", "personal", "undo", "work/x"))
+        with mock.patch.dict(os.environ, {"IMAPSANITY_ACCOUNT": "personal"}):
+            self.assertEqual(cli.select_accounts(cfgs, self.args("apply")), [self.personal])
+
+    def test_one_account_failing_doesnt_stop_the_others(self):
+        self.work.state_dir.mkdir(parents=True)
+        out, err = io.StringIO(), io.StringIO()
+        with open(self.work.state_dir / "lock", "w") as held, \
+                mock.patch.dict(os.environ, {"IMAPSANITY_ACCOUNT": ""}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            rc = cli.main(["--config", str(self.env.cfg_path), "runs"])
+        self.assertEqual(rc, 1)
+        self.assertIn("== personal ==", out.getvalue())
+        self.assertIn("work: skipped: another imapsanity run is in progress", err.getvalue())
+
+        boom = mock.Mock(side_effect=[RuntimeError("down"), 0])
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(cli.COMMANDS, {"runs": boom}), mock.patch.dict(os.environ, {"IMAPSANITY_ACCOUNT": ""}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["--config", str(self.env.cfg_path), "runs"])
+        self.assertEqual((rc, boom.call_count), (1, 2))
+        self.assertIn("personal: error: RuntimeError('down')", err.getvalue())
+
+    def test_runs_prefixes_account(self):
+        j = journal.Journal(self.work, "20260101-000000-apply")
+        j.write({"folder": "INBOX", "dest": "Quarantine"}, "done", "imap")
+        j.close()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.cmd_runs(self.work, None, argparse.Namespace(last=5))
+        self.assertTrue(out.getvalue().startswith("work/20260101-000000-apply"))
 
 
 class TestIndexAndRules(Base):

@@ -32,7 +32,8 @@ def api_key(cfg):
         return os.environ["TYPESAFE_API_KEY"]
     if not cfg.typesafe.keychain_service:
         raise TypeSafeError("set [typesafe].keychain_service or TYPESAFE_API_KEY")
-    r = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", cfg.account.email,
+    who = cfg.typesafe.keychain_account or cfg.account.email
+    r = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", who,
                         "-s", cfg.typesafe.keychain_service, "-w"], capture_output=True, text=True)
     if r.returncode != 0:
         raise TypeSafeError(f"keychain lookup failed for service {cfg.typesafe.keychain_service!r}")

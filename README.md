@@ -181,6 +181,38 @@ Each run is journaled; `bin/imapsanity runs` lists them and `undo <run>` reverse
 | `~/.local/state/imapsanity/plans/` | Every plan, as JSON |
 | `~/.local/state/imapsanity/journal/` | One JSONL file per apply/undo/purge run |
 
+## Several accounts
+A single `[account]` table is one account, exactly as above. For more, replace it with `[[account]]` entries.
+Everything outside them (`[safety]`, `[ai]`, `[auto]`, `[typesafe]`, `[destinations]`, filers, rules) is shared,
+and each entry can override it:
+```toml
+[[account]]
+name = "personal"                           # letters, digits, - and _
+email = "you@example.com"
+imap_host = "imap.example.com"
+keychain_service = "imap-password"
+maildir = "~/Mail/personal"                 # required
+pull = [["/opt/homebrew/bin/mbsync", "personal"]]   # default: [mbsync].pull
+state = "~/.local/state/imapsanity"         # default: [paths].state/<name>; set this to keep old history
+  [account.safety]                          # merged key by key over [safety] (also ai, auto, typesafe, rules, index)
+  max_moves_per_run = 50
+  [account.destinations]
+  allow = ["Clients"]                       # added to the shared allow list
+  [account.filers.Clients]                  # added to the shared filers (same name replaces one)
+  folder = "Clients"
+  keep = "all"
+  [[account.match]]                         # run before the shared rules; labelled personal:match#N
+  sender = "@client.com"
+  filer = "Clients"
+```
+Pick an account with `--account NAME` (or `IMAPSANITY_ACCOUNT`). Without one, `check`, `index`, `plan`,
+`sync pull`, `cycle`, `runs`, `shadow-report` and `suggest-rules` run for each account in turn, one launchd job
+covers them all, and an account that fails or is locked by a manual run is skipped without stopping the others.
+Everything else needs `--account`, and `purge` always does. Run ids print as `personal/<run>`, which `undo`
+accepts as is. Each account has its own index, plans, journal, AI cache, remembered rejections and caps; note
+that `[ai].max_budget_usd` is per account, so a `plan` across accounts can spend that much on each. TypeSafe's
+key is looked up under the account's email unless `[typesafe].keychain_account` is set.
+
 ## Rules
 ```toml
 [filers.OneOfThese]
