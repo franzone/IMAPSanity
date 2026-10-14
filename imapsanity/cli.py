@@ -5,6 +5,7 @@ import fcntl
 import os
 import sys
 import time
+import traceback
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
@@ -12,7 +13,7 @@ from datetime import datetime
 from . import ai, apply, guards, journal, plan, rules, shadow, sync, typesafe
 from .backends import BackendError
 from .backends.imap import ImapBackend
-from .config import ConfigError, load_all
+from .config import ConfigError, load_all, pick
 from .index import Index
 
 
@@ -319,18 +320,16 @@ PER_ACCOUNT = {"check", "index", "plan", "cycle", "runs", "shadow-report", "sugg
 
 def select_accounts(cfgs, args):
     """The accounts this invocation runs against, or a ConfigError saying why none fit."""
-    name = args.account or os.environ.get("IMAPSANITY_ACCOUNT")
+    named = bool(cfgs[0].name)   # [[account]] entries, not a single [account] table
+    # The environment variable only means something to a config with named accounts.
+    name = args.account or (os.environ.get("IMAPSANITY_ACCOUNT") if named else None)
     if args.cmd == "undo" and "/" in args.run:
         run_account, args.run = args.run.split("/", 1)
         if name and name != run_account:
             raise ConfigError(f"run {run_account}/{args.run} is not in account {name!r}")
         name = run_account
-    named = bool(cfgs[0].name)   # [[account]] entries, not a single [account] table
     if name:
-        picked = [c for c in cfgs if c.name == name]
-        if not picked:
-            raise ConfigError(f"no account {name!r} (have: {', '.join(c.name or '(unnamed)' for c in cfgs)})")
-        return picked
+        return [pick(cfgs, name)]
     # purge is the only command that deletes mail, so it always names its account.
     if args.cmd == "purge" and named:
         raise ConfigError(f"purge needs --account ({', '.join(c.name for c in cfgs)})")
@@ -368,12 +367,13 @@ def main(argv=None):
         try:
             rc = max(rc, run_one(cfg, args) or 0)
         except SystemExit as e:
-            if isinstance(e.code, int):
-                rc = max(rc, e.code)
-            else:
+            if isinstance(e.code, str):
                 print(f"{cfg.name}: skipped: {e.code}", file=sys.stderr)
                 rc = max(rc, 1)
-        except Exception as e:
-            print(f"{cfg.name}: error: {e!r}", file=sys.stderr)
+            else:
+                rc = max(rc, e.code or 0)
+        except Exception:
+            print(f"{cfg.name}: error:", file=sys.stderr)
+            traceback.print_exc()
             rc = max(rc, 1)
     return rc

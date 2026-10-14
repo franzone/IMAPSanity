@@ -4,7 +4,7 @@ import copy
 import os
 import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent.parent
@@ -151,6 +151,10 @@ def _section(raw, name, cls):
     unknown = set(data) - known
     if unknown:
         raise ConfigError(f"[{name}] unknown keys: {', '.join(sorted(unknown))}")
+    missing = [f.name for f in fields(cls)
+               if f.default is MISSING and f.default_factory is MISSING and f.name not in data]
+    if missing:
+        raise ConfigError(f"[{name}] missing keys: {', '.join(missing)}")
     return cls(**data)
 
 
@@ -159,6 +163,8 @@ ACCOUNT_PATH_KEYS = {"name", "maildir", "state", "pull", "push", "maildir_folder
 # Shared sections an [[account]] entry may override key by key.
 ACCOUNT_SECTIONS = {"safety", "ai", "auto", "typesafe", "rules", "index"}
 ACCOUNT_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+# With [[account]] entries these name one account's mail, so they belong in each entry.
+PER_ACCOUNT_ONLY = [("paths", "maildir"), ("mbsync", "pull"), ("mbsync", "push"), ("backends", "maildir_folders")]
 
 
 def load_all(path=None):
@@ -175,6 +181,10 @@ def load_all(path=None):
         return [_build(path, raw, "")]
     if not accounts:
         raise ConfigError("an [account] section or [[account]] entries are required")
+    for section, key in PER_ACCOUNT_ONLY:
+        if raw.get(section, {}).get(key):
+            raise ConfigError(f"[{section}].{key} can't be shared between [[account]] entries; "
+                              f"set {key} in each entry instead")
     cfgs, seen = [], set()
     for entry in accounts:
         name = entry.get("name", "")
@@ -183,18 +193,47 @@ def load_all(path=None):
         if name in seen:
             raise ConfigError(f"[[account]] name {name!r} is used twice")
         seen.add(name)
-        cfgs.append(_build(path, _merge_account(raw, entry), name))
+        try:
+            cfgs.append(_build(path, _merge_account(raw, entry), name))
+        except ConfigError as e:
+            raise ConfigError(f"[[account]] {name}: {e}") from None
+    _check_separate(cfgs)
     return cfgs
+
+
+def _check_separate(cfgs):
+    """Accounts must not share (or nest) state or maildir directories, nor pull each other's mail."""
+    def overlap(a, b):
+        return a == b or a in b.parents or b in a.parents
+
+    for i, a in enumerate(cfgs):
+        for cmd in a.pull_commands + [a.push_command]:
+            if len(cfgs) > 1 and ("-a" in cmd or "--all" in cmd):
+                raise ConfigError(f"[[account]] {a.name}: mbsync {' '.join(cmd[1:])!r} syncs every channel, "
+                                  f"including other accounts'; name this account's channel or group")
+        for b in cfgs[i + 1:]:
+            for what in ("state_dir", "maildir"):
+                pa, pb = getattr(a, what).absolute(), getattr(b, what).absolute()
+                if overlap(pa, pb):
+                    raise ConfigError(f"[[account]] {a.name} and {b.name}: {what} {pa} and {pb} overlap")
+            shared = [c for c in a.pull_commands if c in b.pull_commands]
+            if shared or (a.push_command and a.push_command == b.push_command):
+                raise ConfigError(f"[[account]] {a.name} and {b.name} run the same mbsync command; "
+                                  f"give each account its own channel or group")
+
+
+def pick(cfgs, name):
+    for cfg in cfgs:
+        if cfg.name == name:
+            return cfg
+    raise ConfigError(f"no account {name!r} (have: {', '.join(c.name or '(unnamed)' for c in cfgs)})")
 
 
 def load(path=None, account=None):
     """The Config for one account: the named one, or the only one."""
     cfgs = load_all(path)
     if account:
-        for cfg in cfgs:
-            if cfg.name == account:
-                return cfg
-        raise ConfigError(f"no account {account!r} (have: {', '.join(c.name or '(unnamed)' for c in cfgs)})")
+        return pick(cfgs, account)
     if len(cfgs) > 1:
         raise ConfigError(f"several accounts configured; pick one with --account "
                           f"({', '.join(c.name for c in cfgs)})")
@@ -208,16 +247,18 @@ def _merge_account(raw, entry):
         "destinations", "filers", "match"}
     unknown = set(entry) - known
     if unknown:
-        raise ConfigError(f"[[account]] {name}: unknown keys: {', '.join(sorted(unknown))}")
+        raise ConfigError(f"unknown keys: {', '.join(sorted(unknown))}")
     if not entry.get("maildir"):
-        raise ConfigError(f"[[account]] {name}: maildir is required")
+        raise ConfigError("maildir is required")
+    unknown = set(entry.get("destinations", {})) - {"allow"}
+    if unknown:
+        raise ConfigError(f"[account.destinations] unknown keys: {', '.join(sorted(unknown))}")
 
     merged = {k: copy.deepcopy(v) for k, v in raw.items() if k not in ("account", "paths", "mbsync", "backends")}
     merged["account"] = {k: v for k, v in entry.items() if k in Account.__dataclass_fields__}
     shared_state = raw.get("paths", {}).get("state", "~/.local/state/imapsanity")
     merged["paths"] = {"maildir": entry["maildir"], "state": entry.get("state") or f"{shared_state}/{name}"}
-    mbsync = raw.get("mbsync", {})
-    merged["mbsync"] = {"pull": entry.get("pull", mbsync.get("pull", [])), "push": entry.get("push", [])}
+    merged["mbsync"] = {"pull": entry.get("pull", []), "push": entry.get("push", [])}
     merged["backends"] = {"maildir_folders": entry.get("maildir_folders", [])}
     for section in ACCOUNT_SECTIONS:
         merged[section] = {**merged.get(section, {}), **entry.get(section, {})}

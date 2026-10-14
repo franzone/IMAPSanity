@@ -115,7 +115,7 @@ class TestMultiAccount(Base):
     def setUp(self):
         super().setUp()
         text = self.env.cfg_path.read_text()
-        shared = text[text.index("[paths]"):]
+        shared = text[text.index("[paths]"):].replace(f'maildir = "{self.env.root}/Mail"\n', "")
         self.env.cfg_path.write_text(shared + MULTI_ACCOUNTS.format(root=self.env.root))
         self.personal, self.work = load_all(self.env.cfg_path)
 
@@ -154,13 +154,35 @@ class TestMultiAccount(Base):
 
     def test_bad_account_entries(self):
         text = self.env.cfg_path.read_text()
-        for bad in (text.replace('name = "work"', 'name = "personal"'),
-                    text.replace('name = "work"', 'name = "../x"'),
-                    text.replace('state = ', 'stat = '),
-                    text.replace('maildir = "{}/Mail2"'.format(self.env.root), '')):
+        root = self.env.root
+        cases = {
+            "used twice": text.replace('name = "work"', 'name = "personal"'),
+            "letters, digits": text.replace('name = "work"', 'name = "../x"'),
+            "work: unknown keys: stat": text.replace('state = ', 'stat = '),
+            "work: maildir is required": text.replace(f'maildir = "{root}/Mail2"', ''),
+            # A missing required key is a config error, not a TypeError.
+            "work: [account] missing keys: imap_host": text.replace('imap_host = "imap.work.com"', ''),
+            # Errors inside a per-account section say which account they're in.
+            "work: [ai] unknown keys: enabeld": text.replace("enabled = false", "enabeld = false"),
+            "personal: [account.destinations] unknown keys: alow": text.replace('allow = ["Clients"]',
+                                                                                'alow = ["Clients"]'),
+            # Settings naming one account's mail can't be shared.
+            "[mbsync].pull can't be shared": text.replace("[mbsync]", '[mbsync]\npull = [["mbsync", "x"]]'),
+            "[backends].maildir_folders can't be shared": text.replace("maildir_folders = []",
+                                                                       'maildir_folders = ["Local/Inbox"]'),
+            "[paths].maildir can't be shared": text.replace("[paths]", f'[paths]\nmaildir = "{root}/Mail"'),
+            # Accounts can't share or nest state dirs or maildirs, or pull each other's mail.
+            "state_dir": text.replace(f'state = "{root}/oldstate"', f'state = "{root}/state/personal"'),
+            "maildir": text.replace(f'maildir = "{root}/Mail2"', f'maildir = "{root}/Mail/sub"'),
+            "same mbsync command": text.replace(f'state = "{root}/oldstate"',
+                                               f'state = "{root}/oldstate"\npull = [["mbsync", "personal"]]'),
+            "syncs every channel": text.replace('["mbsync", "personal"]', '["mbsync", "-a"]'),
+        }
+        for message, bad in cases.items():
             self.env.cfg_path.write_text(bad)
-            with self.assertRaises(ConfigError):
+            with self.assertRaises(ConfigError, msg=message) as cm:
                 load_all(self.env.cfg_path)
+            self.assertIn(message, str(cm.exception))
 
     def test_select_accounts(self):
         cfgs = [self.personal, self.work]
@@ -181,6 +203,11 @@ class TestMultiAccount(Base):
                 cli.select_accounts(cfgs, self.args("--account", "personal", "undo", "work/x"))
         with mock.patch.dict(os.environ, {"IMAPSANITY_ACCOUNT": "personal"}):
             self.assertEqual(cli.select_accounts(cfgs, self.args("apply")), [self.personal])
+            # A single [account] table has no names, so the variable doesn't apply to it.
+            legacy = self.cfg   # loaded from the single-[account] file before setUp rewrote it
+            self.assertEqual(cli.select_accounts([legacy], self.args("apply")), [legacy])
+            with self.assertRaises(ConfigError):
+                cli.select_accounts([legacy], self.args("--account", "personal", "apply"))
 
     def test_one_account_failing_doesnt_stop_the_others(self):
         self.work.state_dir.mkdir(parents=True)
@@ -200,7 +227,39 @@ class TestMultiAccount(Base):
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.main(["--config", str(self.env.cfg_path), "runs"])
         self.assertEqual((rc, boom.call_count), (1, 2))
-        self.assertIn("personal: error: RuntimeError('down')", err.getvalue())
+        self.assertIn("personal: error:", err.getvalue())
+        self.assertIn("Traceback", err.getvalue())
+        self.assertIn("RuntimeError: down", err.getvalue())
+
+        clean = mock.Mock(side_effect=[SystemExit(None), SystemExit(0)])
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(cli.COMMANDS, {"runs": clean}), mock.patch.dict(os.environ, {"IMAPSANITY_ACCOUNT": ""}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["--config", str(self.env.cfg_path), "runs"])
+        self.assertEqual((rc, err.getvalue()), (0, ""))
+
+    def test_password_env_is_per_account(self):
+        from imapsanity.backends.imap import get_password
+        env = {"IMAPSANITY_PASSWORD": "shared", "IMAPSANITY_PASSWORD_WORK": "w"}
+        with mock.patch.dict(os.environ, env), mock.patch("subprocess.run") as run:
+            self.assertEqual(get_password(self.work.account, "work"), "w")
+            self.assertEqual(get_password(self.cfg.account, ""), "shared")
+            run.return_value = mock.Mock(returncode=0, stdout="kc\n")
+            # The shared variable is never used for a named account.
+            self.assertEqual(get_password(self.personal.account, "personal"), "kc")
+
+    def test_suggest_rules_writes_account_rules(self):
+        self.idx.close()
+        self.idx = Index(self.personal)
+        for i in range(3):
+            self.env.add("INBOX", "promo@vendor.com", f"Sale {i}")
+        result = {"suggestions": [{"sender": "promo@vendor.com", "filer": "One", "reason": "bulk"}]}
+        with mock.patch.object(ai, "run_claude", return_value=(result, 0.01)):
+            self.idx.update(verbose=False)
+            text = ai.suggest_rules(self.personal, self.idx, min_count=3, out=quiet)
+        self.assertIn("[[account.match]]", text)
+        self.assertIn("under the [[account]] named 'personal'", text)
+        self.assertNotIn("\n[[match]]", text)
 
     def test_runs_prefixes_account(self):
         j = journal.Journal(self.work, "20260101-000000-apply")

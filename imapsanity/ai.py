@@ -208,8 +208,11 @@ Skip any sender you are unsure about. Reasons under 15 words."""
     }}}, "required": ["suggestions"], "additionalProperties": False}
     out(f"ai: asking for rule suggestions on {len(payload)} senders")
     result, cost = run_claude(cfg, system, json.dumps(payload, ensure_ascii=False), schema)
-    lines = [f"# Suggested by imapsanity suggest-rules (${cost:.4f}). Review, then paste into config.toml.\n"]
+    # For an [[account]] entry the rules belong to that account, not to every account.
+    where = f"under the [[account]] named {cfg.name!r}" if cfg.name else "into config.toml"
+    table = "[[account.match]]" if cfg.name else "[[match]]"
+    lines = [f"# Suggested by imapsanity suggest-rules (${cost:.4f}). Review, then paste {where}.\n"]
     for s in result.get("suggestions", []):
         lines.append(f"# {s['reason']} ({counts.get(s['sender'], 0)} in inbox)\n"
-                     f"[[match]]\nsender = {json.dumps(s['sender'])}\nfiler = {json.dumps(s['filer'])}\n")
+                     f"{table}\nsender = {json.dumps(s['sender'])}\nfiler = {json.dumps(s['filer'])}\n")
     return "\n".join(lines)

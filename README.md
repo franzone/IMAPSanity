@@ -183,8 +183,10 @@ Each run is journaled; `bin/imapsanity runs` lists them and `undo <run>` reverse
 
 ## Several accounts
 A single `[account]` table is one account, exactly as above. For more, replace it with `[[account]]` entries.
-Everything outside them (`[safety]`, `[ai]`, `[auto]`, `[typesafe]`, `[destinations]`, filers, rules) is shared,
-and each entry can override it:
+`[safety]`, `[ai]`, `[auto]`, `[typesafe]`, `[destinations]`, filers and rules stay outside them and are shared;
+each entry can override them. What names one account's mail (`maildir`, mbsync `pull`/`push`,
+`maildir_folders`) goes in each entry: setting `[paths].maildir`, `[mbsync]` or `[backends].maildir_folders`
+at the top level is a config error.
 ```toml
 [[account]]
 name = "personal"                           # letters, digits, - and _
@@ -192,7 +194,8 @@ email = "you@example.com"
 imap_host = "imap.example.com"
 keychain_service = "imap-password"
 maildir = "~/Mail/personal"                 # required
-pull = [["/opt/homebrew/bin/mbsync", "personal"]]   # default: [mbsync].pull
+pull = [["/opt/homebrew/bin/mbsync", "personal"]]   # this account's channel or group, never -a
+push = []                                   # and maildir_folders = [...], as in [mbsync] / [backends]
 state = "~/.local/state/imapsanity"         # default: [paths].state/<name>; set this to keep old history
   [account.safety]                          # merged key by key over [safety] (also ai, auto, typesafe, rules, index)
   max_moves_per_run = 50
@@ -205,13 +208,17 @@ state = "~/.local/state/imapsanity"         # default: [paths].state/<name>; set
   sender = "@client.com"
   filer = "Clients"
 ```
-Pick an account with `--account NAME` (or `IMAPSANITY_ACCOUNT`). Without one, `check`, `index`, `plan`,
-`sync pull`, `cycle`, `runs`, `shadow-report` and `suggest-rules` run for each account in turn, one launchd job
-covers them all, and an account that fails or is locked by a manual run is skipped without stopping the others.
+Accounts can't share or nest `state` or `maildir` directories, or run the same mbsync command: a manual run
+locks only its own account, so a pull that touched another account's maildir could change it mid-run.
+Pick an account with `--account NAME` (or `IMAPSANITY_ACCOUNT`, which a single `[account]` config ignores).
+Without one, `check`, `index`, `plan`, `sync pull`, `cycle`, `runs`, `shadow-report` and `suggest-rules` run for
+each account in turn, one launchd job covers them all, and an account that fails or is locked by a manual run is skipped without stopping the others.
 Everything else needs `--account`, and `purge` always does. Run ids print as `personal/<run>`, which `undo`
 accepts as is. Each account has its own index, plans, journal, AI cache, remembered rejections and caps; note
 that `[ai].max_budget_usd` is per account, so a `plan` across accounts can spend that much on each. TypeSafe's
-key is looked up under the account's email unless `[typesafe].keychain_account` is set.
+key is looked up under the account's email unless `[typesafe].keychain_account` is set. The password variable
+is `IMAPSANITY_PASSWORD_<NAME>` (e.g. `IMAPSANITY_PASSWORD_PERSONAL`); `IMAPSANITY_PASSWORD` is only used by a
+single `[account]`. `suggest-rules` writes `[[account.match]]` snippets for the account it ran against.
 
 ## Rules
 ```toml
