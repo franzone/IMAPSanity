@@ -369,6 +369,20 @@ class TestBacklogLimits(Base):
 
 
 class TestImapBackend(Base):
+    def test_tls_verifies_the_server(self):
+        import ssl
+        conn = FakeIMAP({"INBOX": {}})
+        conn.login = mock.Mock(return_value=("OK", [b""]))
+        with mock.patch("imaplib.IMAP4_SSL", return_value=conn) as ctor, \
+                mock.patch.dict(os.environ, {"IMAPSANITY_PASSWORD": "pw"}):
+            with ImapBackend(self.cfg):
+                pass
+        (host, port), kw = ctor.call_args
+        self.assertEqual((host, port), ("imap.example.com", 993))
+        self.assertEqual(kw["ssl_context"].verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(kw["ssl_context"].check_hostname)
+        conn.login.assert_called_once_with("me@example.com", "pw")
+
     def fake(self):
         return FakeIMAP({
             "INBOX": {1: ("<a@x>", "\\Seen"), 2: ("<dup@x>", ""), 3: ("<dup@x>", ""), 4: ("<f@x>", "\\Flagged")},
