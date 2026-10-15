@@ -846,6 +846,13 @@ class TestDashboard(QuarantineHelpers, ImapFixture, Base):
         self.assertIn("[oops", page)   # what you typed is still there
         self.assertEqual(self.env.cfg_path.read_text(), before)
 
+    def test_default_config_path(self):
+        from imapsanity import dashboard
+        with mock.patch.dict(os.environ, {"IMAPSANITY_CONFIG": str(self.env.cfg_path)}):
+            app = dashboard.App(None, 1)   # `serve` without --config
+            self.assertEqual(app.config_path, self.env.cfg_path)
+            self.assertEqual(app.get_config({}).status, 200)
+
     def test_busy_while_cycle_holds_the_lock(self):
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
         with open(self.cfg.state_dir / "lock", "w") as held:

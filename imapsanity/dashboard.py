@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from . import apply, cli, configedit, exceptions, journal, plan, quarantine
 from .config import ConfigError, Match, load_all
+from .config import config_path as resolve_config_path
 from .index import Index
 from .message import read_snippet
 from .rules import rule_matches
@@ -147,7 +148,7 @@ def redirect(path, msg=None, bad=False):
 
 class App:
     def __init__(self, config_path, port, token=None):
-        self.config_path = config_path
+        self.config_path = resolve_config_path(config_path)   # None (no --config) means the default file
         self.port = port
         self.token = token or secrets.token_urlsafe(24)
         self.cookie = f"imapsanity{port}"
