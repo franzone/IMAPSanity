@@ -659,7 +659,14 @@ class TestDashboard(QuarantineHelpers, ImapFixture, Base):
         status, headers, page = self.http("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
-        self.assertNotIn("<script", page)
+        # the one script is the fixed Check all / Clear all helper, allowed only by its hash
+        from imapsanity import dashboard
+        import base64, hashlib, re
+        scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
+        self.assertEqual(scripts, [dashboard.SELECT_JS])
+        digest = base64.b64encode(hashlib.sha256(scripts[0].encode()).digest()).decode()
+        self.assertIn(f"script-src 'sha256-{digest}';", headers["Content-Security-Policy"])
+        self.assertNotIn("unsafe-inline';", headers["Content-Security-Policy"].split("style-src")[0])
         q = "/a/_/quarantine"
         self.assertEqual(self.http("POST", q, {"action": "junk", "msgid": "x"},
                                    headers={"Origin": "http://evil.example"})[0], 403)
@@ -685,6 +692,8 @@ class TestDashboard(QuarantineHelpers, ImapFixture, Base):
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;", page)
         self.assertIn("Trimmed by your keep-last-N rules", page)
         self.assertIn("Confirm all 1 as junk", page)
+        self.assertIn('data-check="1">Check all</button>', page)
+        self.assertIn('data-check="0">Clear all</button>', page)
         status, headers, _ = self.http("POST", "/a/_/quarantine", {"action": "junk", "msgid": [m]})
         self.assertEqual(status, 303)
         self.assertIn("Confirmed+as+junk", headers["Location"])
