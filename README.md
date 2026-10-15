@@ -19,11 +19,12 @@ mbsync pull ─▶ index ─▶ rules ─┐
 | `review` | Approve or reject AI proposals, grouped by sender. Rejections are remembered. |
 | `apply` | The only command that moves mail. Dry run unless `--execute`. |
 | `undo` | Reverses a run from its journal. |
-| `purge` | The only command that deletes mail: old quarantined messages, after you type a confirmation. |
+| `purge` | The only command that deletes mail: old quarantined messages you confirmed as junk, after you type a confirmation. |
+| `serve` | Local web dashboard: review the quarantine and AI proposals, undo runs, run the commands above. |
 
 ### Safety guarantees
 * **No deletes.** Keep-last-N moves extras to `Quarantine`. Only `purge --execute` deletes, only messages
-  imapsanity itself quarantined, only after N days, only after typing `PURGE <count>`.
+  imapsanity itself quarantined and you confirmed as junk, only after N days, only after typing `PURGE <count>`.
 * **AI proposes only.** Claude runs headless (`claude -p`) with every tool disabled, no MCP servers and no
   settings, in an empty temp dir. Its answer must match a JSON schema whose destinations are your allow
   list. Every AI proposal starts unapproved. Email content is treated as untrusted (prompt injection can at
@@ -53,6 +54,30 @@ mbsync pull ─▶ index ─▶ rules ─┐
 3. `bin/imapsanity check` and create anything missing, e.g. `bin/imapsanity mkfolder Quarantine`.
 
 ## Day-to-day use
+
+### The dashboard
+```
+bin/imapsanity serve                   # opens http://127.0.0.1:8765 in your browser (--port, --no-open)
+```
+A local web page for the review work, so you don't have to read everything in a terminal:
+
+* **Quarantine** sorts what imapsanity quarantined into three sections, so a careful look goes where it matters:
+  * *Look carefully*: you've written to the sender, or TypeSafe thinks it's personal or a bill/alert/notice.
+    Nothing is pre-selected, and a snippet of each message is shown.
+  * *Worth a glance*: quarantined on the AI's judgment.
+  * *Trimmed by your keep-last-N rules*: extras from senders you wrote rules for, with one "confirm all" button.
+
+  For each sender: **Confirm junk** (only confirmed junk is ever purged), **Rescue** (move it back where it came
+  from and never quarantine that message again) or **Rescue + keep sender** (the same for everything from them).
+* **Exceptions** lists the senders and messages you've kept, and lets you add or remove them. They're stored per
+  account in `<state>/exceptions.json` and work like `protected_senders`; `config.toml` is never rewritten.
+* **AI review** is `review` with the least confident proposals first and quarantine proposals unticked.
+* **Runs** has an undo button per run; **Actions** runs pull, plan, apply and suggest-rules. Anything that moves
+  mail shows a preview first.
+
+It only listens on 127.0.0.1, and the link it prints (with a one-time token) is the only way in. Pages have no
+JavaScript. Changes go through the same guards and journal as the CLI, under the account's lock: if the scheduled
+`cycle` is running, the dashboard says so and changes nothing.
 
 ### The daily triage (a few minutes)
 ```
@@ -86,12 +111,14 @@ Suggestions are written to `~/.local/state/imapsanity/suggested-rules-*.toml` an
 changed. Paste the ones you agree with. Every rule you add is one less thing for the AI to guess about
 (and the unattended `cycle` below only uses rules).
 
-Look through `Quarantine` in any mail client. To rescue something, just move it out yourself. When you're happy:
+Review `Quarantine` in the dashboard (`serve`), confirming junk and rescuing anything that isn't. Then:
 ```
 bin/imapsanity purge --older-than 30             # list what would be deleted
 bin/imapsanity purge --older-than 30 --execute   # asks you to type "PURGE <count>"
 ```
-Purge only deletes messages imapsanity itself quarantined. Anything you put there by hand is left alone.
+Purge only deletes messages imapsanity itself quarantined and you confirmed as junk; the rest are counted and kept.
+`--include-unreviewed` also deletes ones you haven't reviewed (the old behaviour). Anything you put there by hand
+is left alone.
 
 ### Unattended (launchd)
 `cycle` = pull, rules-only plan, apply, pull. AI moves mail here only in live mode (see below), and every
@@ -179,7 +206,8 @@ Each run is journaled; `bin/imapsanity runs` lists them and `undo <run>` reverse
 | `config.toml` | Your account, rules, safety limits and AI settings (gitignored) |
 | `~/.local/state/imapsanity/index.sqlite3` | Index, AI and TypeSafe caches and your review decisions (safe to delete; rebuilt on next run, but AI results are re-billed) |
 | `~/.local/state/imapsanity/plans/` | Every plan, as JSON |
-| `~/.local/state/imapsanity/journal/` | One JSONL file per apply/undo/purge run |
+| `~/.local/state/imapsanity/journal/` | One JSONL file per apply/undo/purge/rescue run |
+| `~/.local/state/imapsanity/exceptions.json` | Senders and messages you kept in the dashboard |
 
 ## Several accounts
 A single `[account]` table is one account, exactly as above. For more, replace it with `[[account]]` entries.

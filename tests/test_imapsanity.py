@@ -6,14 +6,16 @@ import json
 import os
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from unittest import mock
 
-from imapsanity import ai, apply, cli, guards, journal, maildir, plan, rules, shadow, sync, typesafe
+from imapsanity import ai, apply, cli, guards, journal, maildir, plan, quarantine, rules, shadow, sync, typesafe
 from imapsanity.backends.imap import ImapBackend
 from imapsanity.config import ConfigError, load, load_all
 from imapsanity.index import Index
 
-from .helpers import Env, FakeIMAP
+from .helpers import FOLDERS, Env, FakeIMAP
 
 
 def quiet(*a, **k):
@@ -394,7 +396,9 @@ class TestImapBackend(Base):
             ImapBackend(self.cfg, conn=FakeIMAP({}, caps="IMAP4rev1")).__enter__()
 
 
-class TestApplyUndoPurge(Base):
+class ImapFixture:
+    """A fake IMAP server behind the apply backend."""
+
     def setUp(self):
         super().setUp()
         self.conn = FakeIMAP({"INBOX": {}, "INBOX.IMAPSanity.One": {}, "INBOX.IMAPSanity.VIP": {},
@@ -413,6 +417,8 @@ class TestApplyUndoPurge(Base):
         actions, _ = self.plan_rules()
         return plan.save(self.cfg, plan.new_plan(actions))
 
+
+class TestApplyUndoPurge(ImapFixture, Base):
     def test_dry_run_changes_nothing(self):
         self.seed("INBOX", "sale@deals.com", "x")
         path = self.make_plan()
@@ -484,6 +490,226 @@ class TestApplyUndoPurge(Base):
         apply.purge(self.cfg, 0, execute=True, inp=lambda _: "PURGE 1", out=quiet)
         self.assertEqual(len(self.conn.boxes["INBOX.Quarantine"]), 0)
         self.assertEqual(len(self.conn.boxes["INBOX.IMAPSanity.One"]), 1)  # filed mail untouched
+
+
+class QuarantineHelpers:
+    """Messages with arbitrary headers, and mirroring the fake server into the local maildir."""
+
+    def put(self, folder, sender, subject, extra="", days_ago=0):
+        """A message with arbitrary extra headers, locally and on the fake server."""
+        self.env.counter += 1
+        n = self.env.counter
+        msgid = f"<q{n}@test>"
+        date = format_datetime(datetime.now(timezone.utc) - timedelta(days=days_ago))
+        path = self.env.mail / folder / "cur" / f"17100000{n:02d}.1_{n}.host,U={n}:2,S"
+        path.write_text(f"From: {sender}\nSubject: {subject}\nDate: {date}\nMessage-ID: {msgid}\n{extra}\nbody {n}\n")
+        box = self.conn.boxes["INBOX" if folder == "INBOX" else "INBOX." + folder.replace("/", ".")]
+        box[len(box) + 1] = (msgid, "")
+        return msgid
+
+    def mirror(self):
+        """Make the local maildir match the fake server, as an mbsync pull would."""
+        where = {m: name for name, box in self.conn.boxes.items() for m, _ in box.values()}
+        for folder in FOLDERS:
+            for f in (self.env.mail / folder / "cur").iterdir():
+                m = next((line.split(": ", 1)[1] for line in f.read_text().splitlines()
+                          if line.startswith("Message-ID: ")), None)
+                target = where.get(m)
+                if target is None:
+                    continue   # local-only (e.g. a Sent message the test wrote), or purged: leave it
+                local = "INBOX" if target == "INBOX" else target[6:].replace(".", "/")
+                if local != folder:
+                    f.rename(self.env.mail / local / "cur" / f.name)
+        self.idx.update(verbose=False)
+
+    def quarantine(self, *msgids, source="rule"):
+        self.idx.update(verbose=False)
+        rows = [r for r in self.idx.live("INBOX") if r["msgid"] in msgids]
+        actions = [plan.make_action(r, "Quarantine", source, f"test {source}", True) for r in rows]
+        path = plan.save(self.cfg, plan.new_plan(actions))
+        self.assertEqual(apply.apply_plan(self.cfg, self.idx, path, execute=True, out=quiet), 0)
+        self.mirror()
+
+
+class TestQuarantineReview(QuarantineHelpers, ImapFixture, Base):
+    """Quarantine tiers, rescue + exceptions, and purge only deleting confirmed junk."""
+
+    def test_tiers(self):
+        (self.env.mail / "Sent" / "cur" / "1.s,U=1:2,S").write_text(
+            "From: me@example.com\nTo: Friend <Friend@pal.com>\nCc: other@x.com\nMessage-ID: <s1@test>\n\nhi\n")
+        friend = self.put("INBOX", "Friend <friend@pal.com>", "lunch?")
+        trimmed = self.put("INBOX", "news@list.com", "issue 9", extra="List-Id: <news.list.com>\n")
+        self.quarantine(friend, trimmed)
+        pitch = self.put("INBOX", "rep@cold.com", "quick question")
+        self.quarantine(pitch, source="ai")
+        items = {i["msgid"]: i for i in quarantine.items(self.cfg, self.idx)}
+        self.assertEqual({m: quarantine.tier(i) for m, i in items.items()},
+                         {friend: "careful", pitch: "glance", trimmed: "rules"})
+        self.assertIn("you've written to this sender", items[friend]["reasons"])
+        self.assertEqual((items[pitch]["origin"], items[pitch]["why"], items[pitch]["ours"]), ("INBOX", "test ai", True))
+        groups = quarantine.groups(items.values())
+        self.assertEqual([(g["sender"], g["tier"]) for g in groups],
+                         [("friend@pal.com", "careful"), ("rep@cold.com", "glance"), ("news@list.com", "rules")])
+
+    def test_purge_only_deletes_confirmed_junk(self):
+        a, b = self.put("INBOX", "x@a.com", "a"), self.put("INBOX", "y@b.com", "b")
+        self.quarantine(a, b)
+        lines = []
+        apply.purge(self.cfg, 0, execute=True, inp=lambda _: "PURGE 0", out=lines.append, confirmed=set())
+        self.assertEqual(len(self.conn.boxes["INBOX.Quarantine"]), 2)
+        self.assertIn("2 old enough but not confirmed as junk", lines[0])
+        self.idx.confirm_junk([a])
+        apply.purge(self.cfg, 0, execute=True, inp=lambda _: "PURGE 1", out=quiet, confirmed=self.idx.confirmed_junk())
+        self.assertEqual([m for m, _ in self.conn.boxes["INBOX.Quarantine"].values()], [b])
+        self.idx.confirm_junk([b])
+        self.idx.confirm_junk([b], confirmed=False)
+        self.assertEqual(self.idx.confirmed_junk(), {a})
+
+    def test_rescue_keeps_message_out_of_quarantine(self):
+        old = self.put("INBOX", "sale@deals.com", "old", days_ago=3)
+        self.put("INBOX", "sale@deals.com", "new")
+        apply.apply_plan(self.cfg, self.idx, self.make_plan(), execute=True, out=quiet)   # keep-last-1
+        self.mirror()
+        self.assertEqual([i["msgid"] for i in quarantine.items(self.cfg, self.idx)], [old])
+        self.idx.confirm_junk([old])
+
+        tally = quarantine.rescue(self.cfg, self.idx, [old], out=quiet)
+        self.assertEqual(tally, {"moved": 1})
+        self.assertIn(old, [m for m, _ in self.conn.boxes["INBOX"].values()])
+        self.mirror()
+        cfg = self.env.cfg()   # a fresh load sees the saved exception
+        self.assertIn(old, cfg.kept_msgids)
+        self.assertNotIn(old, self.idx.confirmed_junk())
+        self.assertEqual(self.idx.ai_decision(old, "Quarantine"), "rejected")
+        actions, _ = rules.build_actions(cfg, self.idx)
+        self.assertEqual({a["msgid"]: a["dest"] for a in actions}, {old: "IMAPSanity/One"})   # filed, not trimmed
+        self.assertEqual(quarantine.items(cfg, self.idx), [])
+        row = self.idx.live("INBOX")[0]
+        self.assertEqual(guards.action_problem(cfg, plan.make_action(row, "Quarantine", "rule", "x", True)),
+                         "kept message cannot be quarantined")
+
+    def test_rescue_and_keep_sender(self):
+        m = self.put("INBOX", "Pat <pat@co.com>", "invoice")
+        self.quarantine(m, source="ai")
+        quarantine.rescue(self.cfg, self.idx, [m], keep_sender=True, out=quiet)
+        cfg = self.env.cfg()
+        self.assertTrue(cfg.is_protected_sender("Pat <PAT@co.com>"))
+        self.assertEqual(cfg.kept_msgids, set())
+        self.assertIn("pat@co.com", cfg.protected_patterns)
+        self.assertEqual(quarantine.rescue(cfg, self.idx, ["<gone@test>"], out=quiet), {})
+
+
+class TestDashboard(QuarantineHelpers, ImapFixture, Base):
+    def setUp(self):
+        super().setUp()
+        import socket
+        from imapsanity import dashboard
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        self.app = dashboard.App(self.env.cfg_path, port, token="t0ken")
+        handler = dashboard.make_handler(self.app)
+        handler.log_message = lambda *a: None
+        self.server = dashboard.ThreadingHTTPServer(("127.0.0.1", port), handler)
+        self.server.daemon_threads = True
+        import threading
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{port}"
+        self.cookie = f"imapsanity{port}=t0ken"
+
+    def http(self, method, path, form=None, headers=None, cookie=True):
+        import http.client
+        from urllib.parse import urlencode
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=10)
+        hdrs = dict(headers or {})
+        if cookie:
+            hdrs.setdefault("Cookie", self.cookie)
+        body = urlencode(form or {}, doseq=True) if form is not None else None
+        if body is not None:
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+        conn.request(method, path, body=body, headers=hdrs)
+        r = conn.getresponse()
+        out = (r.status, dict(r.getheaders()), r.read().decode())
+        conn.close()
+        return out
+
+    def test_access_control(self):
+        self.assertEqual(self.http("GET", "/", cookie=False)[0], 403)
+        self.assertEqual(self.http("GET", "/login?token=nope", cookie=False)[0], 403)
+        status, headers, _ = self.http("GET", "/login?token=t0ken", cookie=False)
+        self.assertEqual(status, 303)
+        self.assertIn("HttpOnly; SameSite=Strict", headers["Set-Cookie"])
+        self.assertEqual(self.http("GET", "/", headers={"Host": "evil.example:80"})[0], 400)
+        status, headers, page = self.http("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+        self.assertNotIn("<script", page)
+        q = "/a/_/quarantine"
+        self.assertEqual(self.http("POST", q, {"action": "junk", "msgid": "x"},
+                                   headers={"Origin": "http://evil.example"})[0], 403)
+        self.assertEqual(self.http("POST", q, {"action": "junk", "msgid": "x"},
+                                   headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
+        self.assertEqual(self.http("GET", "/a/nobody/quarantine")[0], 404)
+
+    def test_quarantine_page_escapes_and_confirms(self):
+        m = self.put("INBOX", "x@a.com", '<script>alert(1)</script> & "quotes"')
+        self.quarantine(m)
+        status, _, page = self.http("GET", "/a/_/quarantine")
+        self.assertEqual(status, 200)
+        self.assertNotIn("<script>alert", page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;", page)
+        self.assertIn("Trimmed by your keep-last-N rules", page)
+        self.assertIn("Confirm all 1 as junk", page)
+        status, headers, _ = self.http("POST", "/a/_/quarantine", {"action": "junk", "msgid": [m]})
+        self.assertEqual(status, 303)
+        self.assertIn("Confirmed+as+junk", headers["Location"])
+        self.assertEqual(self.idx.confirmed_junk(), {m})
+        self.assertIn("Confirmed junk · 1", self.http("GET", "/a/_/quarantine")[2])
+        self.assertIn("Nothing+selected", self.http("POST", "/a/_/quarantine", {"action": "junk"})[1]["Location"])
+
+    def test_busy_while_cycle_holds_the_lock(self):
+        self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.cfg.state_dir / "lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, headers, _ = self.http("POST", "/a/_/quarantine", {"action": "junk", "msgid": "x"})
+        self.assertEqual(status, 303)
+        self.assertIn("Busy", headers["Location"])
+        self.assertEqual(self.idx.confirmed_junk(), set())
+
+    def test_ai_review_and_apply_preview(self):
+        m = self.put("INBOX", "news@letters.com", "issue 1")
+        q = self.put("INBOX", "rep@cold.com", "pitch")
+        self.idx.update(verbose=False)
+        rows = {r["msgid"]: r for r in self.idx.live("INBOX")}
+        p = plan.new_plan([plan.make_action(rows[m], "Filtered/News", "ai", "newsletter", False, 0.9),
+                           plan.make_action(rows[q], "Quarantine", "ai", "cold pitch", False, 0.8)])
+        path = plan.save(self.cfg, p)
+        page = self.http("GET", "/a/_/review")[2]
+        self.assertLess(page.index("rep@cold.com"), page.index("news@letters.com"))   # least confident first
+        self.assertIn('value="a0001" checked', page)
+        self.assertNotIn('value="a0002" checked', page)   # quarantine proposals start unticked
+        self.http("POST", "/a/_/review", {"plan": path.name, "action": "approve", "id": "a0001"})
+        self.http("POST", "/a/_/review", {"plan": path.name, "action": "reject", "id": "a0002"})
+        self.assertEqual(self.idx.ai_decision(q, "Quarantine"), "rejected")
+        self.assertEqual([a["approved"] for a in plan.load(path)["actions"]], [True, False])
+        self.assertEqual(self.http("POST", "/a/_/review", {"plan": "../x.json", "action": "approve", "id": "a1"})[0], 303)
+
+        status, _, page = self.http("POST", "/a/_/actions", {"op": "apply"})
+        self.assertIn("dry run", page)
+        self.assertIn("Apply for real", page)
+        self.assertEqual(len(self.conn.boxes["INBOX"]), 2)
+        self.http("POST", "/a/_/actions", {"op": "apply-execute", "plan": path.name})
+        self.assertEqual([mm for mm, _ in self.conn.boxes["INBOX.Filtered.News"].values()], [m])
+
+    def test_exceptions_page(self):
+        self.http("POST", "/a/_/exceptions", {"action": "add", "sender": "@Friends.org"})
+        self.assertIn("@friends.org", self.env.cfg().protected_patterns)
+        self.assertIn("@friends.org", self.http("GET", "/a/_/exceptions")[2])
+        self.http("POST", "/a/_/exceptions", {"action": "remove", "kind": "senders", "key": "@friends.org"})
+        self.assertNotIn("@friends.org", self.env.cfg().protected_patterns)
+        self.assertIn("Enter+an+address", self.http("POST", "/a/_/exceptions", {"action": "add", "sender": "a b"})[1]["Location"])
 
 
 class TestMaildirBackendAndBreaker(Base):

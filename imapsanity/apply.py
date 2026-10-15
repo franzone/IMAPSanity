@@ -78,7 +78,7 @@ def apply_plan(cfg, idx, path, execute, max_moves=None, max_fraction=None, max_q
         out("dry run; add --execute to apply")
         return 0
 
-    run_id = journal.new_run_id("apply")
+    run_id = journal.new_run_id("apply", cfg)
     tally = execute_moves(cfg, v.ok, journal.Journal(cfg, run_id), out=out)
     plan["applied_run"] = run_id
     save(cfg, plan, path)
@@ -107,23 +107,29 @@ def undo(cfg, run_id, execute, force=False, out=print):
     if not execute:
         out("dry run; add --execute to undo")
         return 0
-    jnl = journal.Journal(cfg, journal.new_run_id(f"undo-{run_id}"))
+    jnl = journal.Journal(cfg, journal.new_run_id(f"undo-{run_id}", cfg))
     tally = execute_moves(cfg, actions, jnl, check_flagged=False, out=out)
     out("undo: " + ", ".join(f"{k} {n}" for k, n in tally.items()))
     return 0 if set(tally) <= {"moved"} else 1
 
 
-def purge(cfg, days, execute, inp=input, out=print):
-    """Permanently delete messages *we* quarantined at least `days` ago. Human-only."""
+def purge(cfg, days, execute, inp=input, out=print, confirmed=None):
+    """Permanently delete messages *we* quarantined at least `days` ago. Human-only.
+
+    `confirmed`: Message-IDs you confirmed as junk in the dashboard; when given, only those are
+    deleted, so nothing you never looked at disappears. None deletes everything old enough.
+    """
     q = cfg.safety.quarantine
-    last = {}
-    for run in journal.all_runs(cfg):
-        for e in journal.read(cfg, run):
-            if e["status"] in ("moved", "purged") and e.get("msgid"):
-                if e["msgid"] not in last or e["ts"] >= last[e["msgid"]]["ts"]:
-                    last[e["msgid"]] = e
     cutoff = time.time() - days * 86400
-    cands = [e for e in last.values() if e["status"] == "moved" and e["to_folder"] == q and e["ts"] <= cutoff]
+    kept = cfg.kept_msgids
+    cands = [e for e in journal.last_moves(cfg).values()
+             if e["status"] == "moved" and e["to_folder"] == q and e["ts"] <= cutoff and e["msgid"] not in kept]
+    if confirmed is not None:
+        unreviewed = [e for e in cands if e["msgid"] not in confirmed]
+        cands = [e for e in cands if e["msgid"] in confirmed]
+        if unreviewed:
+            out(f"{len(unreviewed)} old enough but not confirmed as junk: kept (review them in "
+                f"`imapsanity serve`, or pass --include-unreviewed)")
     out(f"{len(cands)} message(s) quarantined by imapsanity more than {days} day(s) ago")
     for e in cands[:15]:
         out(f"  {e.get('addr') or ''}  {(e.get('subject') or '')[:70]}")
@@ -137,7 +143,7 @@ def purge(cfg, days, execute, inp=input, out=print):
     if inp(f"Type 'PURGE {len(cands)}' to permanently delete: ").strip() != f"PURGE {len(cands)}":
         out("not confirmed; nothing deleted")
         return 2
-    jnl = journal.Journal(cfg, journal.new_run_id("purge"))
+    jnl = journal.Journal(cfg, journal.new_run_id("purge", cfg))
     try:
         with ImapBackend(cfg) as b:
             results = b.purge(q, [e["msgid"] for e in cands])

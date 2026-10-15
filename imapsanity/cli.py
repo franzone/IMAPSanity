@@ -91,7 +91,8 @@ def cmd_runs(cfg, idx, args):
 
 
 def cmd_purge(cfg, idx, args):
-    return apply.purge(cfg, args.older_than, args.execute)
+    confirmed = None if args.include_unreviewed else idx.confirmed_junk()
+    return apply.purge(cfg, args.older_than, args.execute, confirmed=confirmed)
 
 
 def cmd_sync(cfg, idx, args):
@@ -282,6 +283,8 @@ def build_parser():
     sp = sub.add_parser("purge", help="permanently delete old quarantined messages")
     sp.add_argument("--older-than", type=int, required=True, metavar="DAYS")
     sp.add_argument("--execute", action="store_true")
+    sp.add_argument("--include-unreviewed", action="store_true",
+                    help="also delete messages not confirmed as junk in the dashboard")
 
     sp = sub.add_parser("sync", help="mbsync pull, or breaker-guarded push")
     sp.add_argument("direction", choices=["pull", "push"])
@@ -299,6 +302,10 @@ def build_parser():
 
     sp = sub.add_parser("suggest-rules", help="ask Claude to propose [[match]] rules")
     sp.add_argument("--min-count", type=int, default=3)
+
+    sp = sub.add_parser("serve", help="local web dashboard (quarantine review, AI review, runs, actions)")
+    sp.add_argument("--port", type=int, default=8765)
+    sp.add_argument("--no-open", action="store_true", help="don't open a browser")
 
     sp = sub.add_parser("mkfolder", help="create an allowed destination folder on the server")
     sp.add_argument("folder")
@@ -353,6 +360,9 @@ def run_one(cfg, args):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.cmd == "serve":   # long-running: takes each account's lock only while it changes something
+        from . import dashboard
+        return dashboard.serve(args.config, args.port, open_browser=not args.no_open)
     try:
         cfgs = select_accounts(load_all(args.config), args)
     except ConfigError as e:

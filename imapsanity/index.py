@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS ts_cache (
     model TEXT,
     ts INTEGER
 );
+CREATE TABLE IF NOT EXISTS confirmed_junk (msgid TEXT PRIMARY KEY, ts INTEGER);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -173,6 +174,20 @@ class Index:
 
     def live_by_msgid(self, msgid):
         return self.db.execute("SELECT * FROM messages WHERE msgid=? AND trashed=0", (msgid,)).fetchall()
+
+    # --- quarantine review (dashboard) -----------------------------------------------
+
+    def confirmed_junk(self):
+        """Message-IDs you confirmed as junk; only these are purged by default."""
+        return {r["msgid"] for r in self.db.execute("SELECT msgid FROM confirmed_junk")}
+
+    def confirm_junk(self, msgids, confirmed=True):
+        if confirmed:
+            self.db.executemany("INSERT OR REPLACE INTO confirmed_junk VALUES (?,?)",
+                                [(m, int(time.time())) for m in msgids])
+        else:
+            self.db.executemany("DELETE FROM confirmed_junk WHERE msgid=?", [(m,) for m in msgids])
+        self.db.commit()
 
     # --- meta ---------------------------------------------------------------------
 

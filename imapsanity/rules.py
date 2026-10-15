@@ -53,6 +53,7 @@ def build_actions(cfg, idx):
 
     # 2. Keep last N per rule, across what's already in the filer folder plus what's arriving.
     trims = []
+    kept_msgids = cfg.kept_msgids
     for filer in cfg.filers.values():
         if filer.keep is None:
             continue
@@ -82,6 +83,8 @@ def build_actions(cfg, idx):
             if cfg.is_protected_sender(r["from_raw"]):
                 notes.append(f"not quarantining protected sender: {r['from_raw']}")
                 continue
+            if r["msgid"] in kept_msgids:
+                continue   # rescued in the dashboard: stays wherever it is now
             why = f"keep-last-{filer.keep} ({filer.name}, {rule.label()})"
             if is_incoming:
                 incoming[ident][2:] = [q, why]
