@@ -8,6 +8,7 @@ import email.parser
 import imaplib
 import os
 import re
+import ssl
 import subprocess
 from collections import defaultdict
 
@@ -56,7 +57,9 @@ class ImapBackend:
     def __enter__(self):
         if self.conn is None:
             a = self.cfg.account
-            self.conn = imaplib.IMAP4_SSL(a.imap_host, a.imap_port)
+            # imaplib's default context skips certificate checks; verify the server and its hostname
+            # so the password is only ever sent to the real server.
+            self.conn = imaplib.IMAP4_SSL(a.imap_host, a.imap_port, ssl_context=ssl.create_default_context())
             self.conn.login(a.email, get_password(a, self.cfg.name))
         typ, data = self.conn.capability()
         caps = set(b" ".join(data).decode().upper().split())
