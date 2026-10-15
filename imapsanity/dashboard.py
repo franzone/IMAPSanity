@@ -9,12 +9,14 @@ Local only, by construction:
     the Content-Security-Policy, which forbids every other script; every value taken from mail
     (subjects, senders, snippets) is HTML-escaped.
 Every change goes through the same code the CLI uses (guards, journal, undo), under the account's
-run lock, so a launchd `cycle` and the dashboard never move mail at the same time.
+run lock, so a launchd `cycle` and the dashboard never move mail at the same time. Config edits go
+through configedit: validated, backed up, and written without disturbing the rest of the file.
 """
 
 import argparse
 import base64
 import contextlib
+import difflib
 import hashlib
 import hmac
 import html
@@ -23,6 +25,7 @@ import re
 import secrets
 import sys
 import time
+import tomllib
 import traceback
 import webbrowser
 from collections import Counter
@@ -31,13 +34,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-from . import apply, cli, exceptions, journal, plan, quarantine
-from .config import ConfigError, load_all
+from . import apply, cli, configedit, exceptions, journal, plan, quarantine
+from .config import ConfigError, Match, load_all
 from .index import Index
 from .message import read_snippet
+from .rules import rule_matches
 
 MAX_BODY = 1 << 20
 PLAN_NAME = re.compile(r"^plan-[0-9-]+\.json$")
+CONFIG_BACK = re.compile(r"^/config(/rules|/raw)?(\?[^\r\n]*)?$")
+RULES_PER_PAGE = 100
 UNNAMED = "_"   # URL segment for a single [account] config, whose account has no name
 TIER_TITLES = {
     "careful": ("Look carefully", "Strong signs these might not be junk. Nothing is pre-selected: "
@@ -83,8 +89,12 @@ button.danger { color:var(--bad); border-color:var(--bad); }
 button.small { padding:2px 8px; font-size:12px; }
 select { font:inherit; padding:5px 8px; border-radius:7px; border:1px solid var(--line);
   background:var(--panel); color:var(--text); }
-input[type=text] { font:inherit; padding:6px 8px; border-radius:7px; border:1px solid var(--line);
-  background:var(--panel); color:var(--text); min-width:260px; }
+input[type=text], input[type=number], textarea { font:inherit; padding:6px 8px; border-radius:7px;
+  border:1px solid var(--line); background:var(--panel); color:var(--text); }
+input[type=text] { min-width:260px; }
+input.cell { min-width:0; width:100%; } input[type=number] { width:5.5em; }
+textarea { width:100%; font:13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+td.tight { white-space:nowrap; width:1%; }
 details > summary { cursor:pointer; margin:8px 0; color:var(--accent); }
 pre { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto;
   white-space:pre-wrap; font-size:13px; }
@@ -131,7 +141,7 @@ class Response:
 
 def redirect(path, msg=None, bad=False):
     if msg:
-        path += "?" + urlencode({"msg": msg, **({"bad": "1"} if bad else {})})
+        path += ("&" if "?" in path else "?") + urlencode({"msg": msg, **({"bad": "1"} if bad else {})})
     return Response(status=303, location=path)
 
 
@@ -191,11 +201,14 @@ class App:
     def page(self, title, body, cfg=None, tab=None, query=None):
         accounts = self.accounts()
         nav = [f'<a href="/" class="{"on" if tab == "home" else ""}">Overview</a>']
+        if cfg is None and tab == "config" and len(accounts) == 1:
+            cfg = accounts[0]   # keep the account tabs on the config pages
         if cfg is not None:
             base = f"/a/{quote(self.slug(cfg))}"
             for key, label in (("quarantine", "Quarantine"), ("review", "AI review"), ("runs", "Runs"),
                                ("exceptions", "Exceptions"), ("actions", "Actions")):
                 nav.append(f'<a href="{base}/{key}" class="{"on" if tab == key else ""}">{label}</a>')
+        nav.append(f'<a href="/config" class="{"on" if tab == "config" else ""}">Config</a>')
         switch = ""
         if cfg is not None and len(accounts) > 1:
             switch = " ".join(
@@ -217,6 +230,13 @@ class App:
     def route(self, method, path, query, form):
         if path == "/" and method == "GET":
             return self.overview(query)
+        if path in ("/config", "/config/rules", "/config/raw"):
+            if method == "GET":
+                return {"/config": self.get_config, "/config/rules": self.get_config_rules,
+                        "/config/raw": self.get_config_raw}[path](query)
+            if method == "POST" and path == "/config":
+                return self.post_config(form)
+            return Response("method not allowed", 405)
         m = re.fullmatch(r"/a/([^/]+)/(quarantine|review|runs|exceptions|actions|undo)", path)
         if not m:
             return Response("not found", 404)
@@ -526,6 +546,266 @@ class App:
                 return redirect(base, "Unknown action.", bad=True)
             exceptions.save(cfg.state_dir, exc)
         return redirect(base, msg)
+
+    # --- config editor ----------------------------------------------------------------------
+
+    def _config_hint(self):
+        try:
+            bdir = configedit.backups_dir(self.config_path)
+        except ConfigError:
+            bdir = "<state>/config-backups"
+        return (f'<p class="hint">Edits are written to <code>{h(self.config_path)}</code>. Each save is checked '
+                f'with the same loader <code>cycle</code> uses (an invalid config is refused), the previous file is '
+                f'kept in <code>{h(bdir)}</code>, and only the lines you change are touched, so your comments stay. '
+                f'The next cycle uses the new config. Rules only file new mail out of '
+                f'{h(", ".join(self.accounts()[0].rules_source_folders))}; changing one doesn\'t move mail it already filed.</p>')
+
+    @staticmethod
+    def _hidden(**kw):
+        return "".join(f'<input type="hidden" name="{k}" value="{h(v)}">' for k, v in kw.items())
+
+    def get_config(self, query):
+        text, rev = configedit.read(self.config_path)
+        raw = tomllib.loads(text)
+        filers = raw.get("filers", {})
+        counts = {n: len(configedit.filer_users(raw, n)) for n in filers}
+        rows = []
+        for n, f in filers.items():
+            fid = f"f-{n}"
+            keep = f.get("keep", "all")
+            rows.append(f"""<tr><td class="tight"><b>{h(n)}</b></td>
+<td><input class="cell" type="text" name="folder" value="{h(f.get('folder'))}" form="{fid}" aria-label="folder"></td>
+<td class="tight"><input type="text" name="keep" value="{h(keep)}" form="{fid}" aria-label="keep" style="min-width:0;width:4.5em"></td>
+<td class="tight"><a href="/config/rules?filer={quote(n)}">{counts[n]} use(s)</a></td>
+<td class="tight"><form id="{fid}" method="post" action="/config">{self._hidden(rev=rev, name=n, back="/config")}
+<button name="op" value="update-filer">Save</button> <button name="op" value="delete-filer" class="danger"
+{' disabled title="still used"' if counts[n] else ''}>Delete</button></form></td></tr>""")
+        allow = raw.get("destinations", {}).get("allow", [])
+        accounts = raw["account"] if isinstance(raw.get("account"), list) else []
+        scoped = [(a.get("name"), "filer", fn, f.get("folder")) for a in accounts for fn, f in a.get("filers", {}).items()]
+        scoped += [(a.get("name"), "rule", f"#{i}", f"{m.get('sender', '')} {m.get('subject', '')} → {m.get('filer')}")
+                   for a in accounts for i, m in enumerate(a.get("match", []), 1)]
+        scoped_html = ""
+        if scoped:
+            items = "".join(f"<tr><td>{h(a)}</td><td>{h(k)}</td><td>{h(n)}</td><td>{h(v)}</td></tr>" for a, k, n, v in scoped)
+            scoped_html = (f"<h2>Inside [[account]] entries · {len(scoped)}</h2><p class='hint'>Edit these in the "
+                           f"<a href='/config/raw'>raw editor</a>.</p><table>{items}</table>")
+        body = f"""{self._config_hint()}
+<p><a href="/config/rules"><b>Rules · {len(raw.get('match', []))}</b></a> &nbsp; <a href="/config/raw">Raw config.toml and backups</a></p>
+<h2>Filers · {len(filers)}</h2>
+<p class="hint">A filer is a folder plus how many messages to keep per rule: <code>all</code>, or a number (older
+extras go to the quarantine for review). A filer can only be deleted once no rule uses it.</p>
+<table><tr><th>Name</th><th>Folder</th><th>Keep</th><th>Rules</th><th></th></tr>{"".join(rows)}</table>
+<form method="post" action="/config" class="row">{self._hidden(rev=rev, back="/config")}
+<input type="text" name="name" placeholder="new filer name, e.g. TwentyOfThese" aria-label="name" style="min-width:200px">
+<input type="text" name="folder" placeholder="folder, e.g. IMAPSanity/TwentyOfThese" aria-label="folder">
+<input type="text" name="keep" placeholder="keep: all or 20" aria-label="keep" style="min-width:0;width:9em">
+<button name="op" value="add-filer" class="primary">Add filer</button></form>
+<p class="hint">A new folder has to exist on the server: <code>imapsanity mkfolder FOLDER --execute</code>.</p>
+<h2>Allowed destinations</h2>
+<p class="hint">Folders anything may be moved to, one per line. Filer folders and the quarantine are always allowed.
+Folders in <code>[ai.destinations]</code> must be listed here.</p>
+<form method="post" action="/config">{self._hidden(rev=rev, back="/config")}
+<textarea name="allow" rows="{max(3, len(allow) + 1)}" aria-label="allowed destinations">{h(chr(10).join(allow))}</textarea>
+<div class="row"><button name="op" value="set-allow" class="primary">Save destinations</button></div></form>
+{scoped_html}"""
+        return self.page("Config", body, tab="config", query=query)
+
+    def _filer_select(self, filers, current, form_id=None):
+        attr = f' form="{form_id}"' if form_id else ""
+        opts = "".join(f'<option value="{h(n)}"{" selected" if n == current else ""}>{h(n)}</option>' for n in filers)
+        return f'<select name="filer" aria-label="filer"{attr}>{opts}</select>'
+
+    def get_config_rules(self, query):
+        text, rev = configedit.read(self.config_path)
+        raw = tomllib.loads(text)
+        filers = list(raw.get("filers", {}))
+        rules = list(enumerate(raw.get("match", []), 1))
+        q = (query.get("q") or [""])[0].strip()
+        want = (query.get("filer") or [""])[0]
+        shown = [(n, m) for n, m in rules
+                 if (not q or q.lower() in f"{m.get('sender', '')}\n{m.get('subject', '')}".lower())
+                 and (not want or m.get("filer") == want)]
+        pages = max(1, -(-len(shown) // RULES_PER_PAGE))
+        try:
+            pg = min(max(1, int((query.get("page") or ["1"])[0])), pages)
+        except ValueError:
+            pg = 1
+        back = "/config/rules?" + urlencode({k: v for k, v in (("q", q), ("filer", want), ("page", pg)) if v})
+        rows = []
+        for n, m in shown[(pg - 1) * RULES_PER_PAGE:pg * RULES_PER_PAGE]:
+            fid = f"r{n}"
+            rows.append(f"""<tr><td class="tight"><input type="number" name="position" value="{n}" min="1" max="{len(rules)}"
+ form="{fid}" aria-label="position"></td>
+<td><input class="cell" type="text" name="sender" value="{h(m.get('sender', ''))}" form="{fid}" aria-label="sender"></td>
+<td><input class="cell" type="text" name="subject" value="{h(m.get('subject', ''))}" form="{fid}" aria-label="subject"></td>
+<td class="tight">{self._filer_select(filers, m.get('filer'), fid)}</td>
+<td class="tight"><form id="{fid}" method="post" action="/config">{self._hidden(rev=rev, n=n, back=back)}
+<button name="op" value="update-rule">Save</button> <button name="op" value="preview-rule">Preview</button>
+<button name="op" value="delete-rule" class="danger">Delete</button></form></td></tr>""")
+        nav = ""
+        if pages > 1:
+            links = " ".join(
+                f"<b>{p}</b>" if p == pg else
+                f'<a href="/config/rules?{h(urlencode({k: v for k, v in (("q", q), ("filer", want), ("page", p)) if v}))}">{p}</a>'
+                for p in range(1, pages + 1))
+            nav = f'<p class="row">Page {links}</p>'
+        prefill = {k: (query.get(k) or [""])[0] for k in ("sender", "subject")}
+        filter_opts = "".join(f'<option value="{h(n)}"{" selected" if n == want else ""}>{h(n)}</option>' for n in filers)
+        body = f"""{self._config_hint()}
+<p class="hint">Rules are checked in order and the first match wins. Sender and subject match anywhere in the From
+header / Subject, ignoring case; a rule with both needs both. Change the number to move a rule.
+<b>Preview</b> shows what a rule would file right now, without saving.</p>
+<h2>Add a rule</h2>
+<form method="post" action="/config" class="row">{self._hidden(rev=rev, back=back)}
+<input type="text" name="sender" value="{h(prefill['sender'])}" placeholder="sender, e.g. news@shop.com or @shop.com" aria-label="sender">
+<input type="text" name="subject" value="{h(prefill['subject'])}" placeholder="subject (optional)" aria-label="subject" style="min-width:180px">
+{self._filer_select(filers, None)}
+<input type="number" name="position" min="1" max="{len(rules) + 1}" placeholder="last" aria-label="position">
+<button name="op" value="preview-rule">Preview</button>
+<button name="op" value="add-rule" class="primary">Add rule</button></form>
+<h2>Rules · {len(shown)}{f" of {len(rules)}" if len(shown) != len(rules) else ""}</h2>
+<form method="get" action="/config/rules" class="row"><input type="text" name="q" value="{h(q)}" placeholder="search sender or subject"
+ aria-label="search"><select name="filer" aria-label="filer"><option value="">any filer</option>{filter_opts}</select>
+<button>Filter</button>{' <a href="/config/rules">clear</a>' if q or want else ''}</form>
+{nav}<table><tr><th>#</th><th>Sender</th><th>Subject</th><th>Filer</th><th></th></tr>{"".join(rows)}</table>{nav}"""
+        return self.page("Rules", body, tab="config", query=query)
+
+    def get_config_raw(self, query, text=None, error=None):
+        current, rev = configedit.read(self.config_path)
+        if text is None:
+            text = current
+        err = f'<div class="flash bad">{h(error)}</div>' if error else ""
+        rows = []
+        for b in configedit.backups(self.config_path)[:10]:
+            rows.append(f"""<tr><td>{h(b.name)}</td><td class="nowrap">{h(ago(b.stat().st_mtime))}</td><td class="tight">
+<form method="post" action="/config">{self._hidden(rev=rev, backup=b.name, back="/config/raw")}
+<button name="op" value="restore-preview">Compare and restore…</button></form></td></tr>""")
+        backups = f"<table>{''.join(rows)}</table>" if rows else "<p class='muted'>None yet.</p>"
+        body = f"""{self._config_hint()}{err}
+<form method="post" action="/config">{self._hidden(rev=rev, back="/config/raw")}
+<textarea name="text" rows="32" spellcheck="false" aria-label="config.toml">{h(text)}</textarea>
+<div class="row"><button name="op" value="raw-save" class="primary">Check and save</button>
+<a href="/config/raw">Discard changes</a></div></form>
+<h2>Backups</h2><p class="hint">The {configedit.KEEP_BACKUPS} most recent versions before a dashboard save, newest first.</p>{backups}"""
+        return self.page("Raw config.toml", body, tab="config", query=query)
+
+    def _rule_preview(self, raw, sender, subject, position):
+        """What a rule at `position` among the shared rules would file now, per account."""
+        rule = Match(0, "", sender.strip(), subject.strip())
+        parts = []
+        for cfg in self.accounts():
+            earlier = [m for m in cfg.matches if m.scope] + [m for m in cfg.matches if not m.scope][:position - 1]
+            with self.open(cfg) as idx:
+                rows = [r for f in cfg.rules_source_folders for r in idx.live(f) if rule_matches(rule, r)]
+            taken = [(r, next((m for m in earlier if rule_matches(m, r)), None)) for r in rows]
+            free = [r for r, m in taken if m is None]
+            claimed = Counter(m.label() for _, m in taken if m is not None)
+            sample = "".join(f"<tr><td class='nowrap'>{h(day(r['date_ts']))}</td><td>{h(r['from_raw'])}</td>"
+                             f"<td>{h(r['subject'])}</td></tr>" for r in free[:15])
+            more = f"<p class='muted'>…and {len(free) - 15} more.</p>" if len(free) > 15 else ""
+            claimed_html = "".join(f"<li>{n} by {h(label)}</li>" for label, n in claimed.most_common(10))
+            parts.append(f"""<div class="card"><h3>{h(cfg.name or cfg.account.email)}</h3>
+<p><b>{len(free)}</b> message(s) in {h(", ".join(cfg.rules_source_folders))} would be filed by this rule.</p>
+{f"<p class='hint'>{len(taken) - len(free)} more match but an earlier rule files them first:</p><ul>{claimed_html}</ul>" if claimed else ""}
+{f"<table>{sample}</table>{more}" if sample else ""}</div>""")
+        return "".join(parts)
+
+    def post_config(self, form):
+        def val(k):
+            return (form.get(k) or [""])[0]
+
+        op, rev, back = val("op"), val("rev"), val("back")
+        if not CONFIG_BACK.match(back):
+            back = "/config"
+        path = self.config_path
+        try:
+            text, _ = configedit.read(path)
+            raw = tomllib.loads(text)
+            n_rules = len(raw.get("match", []))
+
+            def number(k, default=None):
+                v = val(k).strip()
+                if not v:
+                    return default
+                if not v.isdigit():
+                    raise configedit.EditError(f"{k} must be a number")
+                return int(v)
+
+            if op == "preview-rule":
+                n = number("n")
+                pos = n or number("position", n_rules + 1)
+                if not (val("sender").strip() or val("subject").strip()):
+                    raise configedit.EditError("a rule needs a sender or a subject")
+                again = (self._hidden(rev=rev, back=back, sender=val("sender"), subject=val("subject"),
+                                      filer=val("filer"), position=val("position"), **({"n": n} if n else {})))
+                what = f"rule #{n}" if n else "the new rule"
+                button = "update-rule" if n else "add-rule"
+                body = f"""<p>{h(what)}: sender <code>{h(val('sender')) or '–'}</code>, subject <code>{h(val('subject')) or '–'}</code>
+→ <b>{h(val('filer'))}</b>{f" at position {pos}" if not n else ""}. Nothing is saved yet.</p>
+<div class="cards">{self._rule_preview(raw, val("sender"), val("subject"), pos)}</div>
+<form method="post" action="/config" class="row">{again}<button name="op" value="{button}" class="primary">Save {h(what)}</button>
+<a href="{h(back)}">Back</a></form>"""
+                return self.page("Rule preview", body, tab="config")
+            if op == "restore-preview":
+                name = val("backup")
+                match = [b for b in configedit.backups(path) if b.name == name]
+                if not match:
+                    raise configedit.EditError("no such backup")
+                old = match[0].read_text()
+                diff = "".join(difflib.unified_diff(text.splitlines(True), old.splitlines(True), "current", name, n=2))
+                body = f"""<p>Changes restoring <code>{h(name)}</code> would make (the current file is backed up first):</p>
+<pre>{h(diff) or "(identical)"}</pre><form method="post" action="/config" class="row">
+{self._hidden(rev=rev, backup=name, back="/config/raw")}<button name="op" value="restore" class="primary">Restore it</button>
+<a href="/config/raw">Back</a></form>"""
+                return self.page("Restore backup", body, tab="config")
+
+            if op == "add-rule":
+                new = configedit.add_rule(text, val("sender"), val("subject"), val("filer"), number("position"))
+                msg = f"Added rule #{number('position') or n_rules + 1}."
+            elif op == "update-rule":
+                n = number("n")
+                new = configedit.update_rule(text, n, val("sender"), val("subject"), val("filer"))
+                to = number("position", n)
+                if to != n:
+                    new = configedit.move_rule(new, n, min(max(1, to), n_rules))
+                msg = f"Saved rule #{n}" + (f", now #{min(max(1, to), n_rules)}." if to != n else ".")
+            elif op == "delete-rule":
+                n = number("n")
+                new = configedit.delete_rule(text, n)
+                m = raw["match"][n - 1] if n and 0 < n <= n_rules else {}
+                msg = f"Deleted rule #{n} ({m.get('sender') or m.get('subject')} → {m.get('filer')}); later rules moved up one."
+            elif op == "add-filer":
+                new = configedit.add_filer(text, val("name"), val("folder"), val("keep") or "all")
+                msg = f"Added filer {val('name').strip()}."
+            elif op == "update-filer":
+                new = configedit.update_filer(text, val("name"), val("folder"), val("keep"))
+                msg = f"Saved filer {val('name')}."
+            elif op == "delete-filer":
+                new = configedit.delete_filer(text, val("name"))
+                msg = f"Deleted filer {val('name')}."
+            elif op == "set-allow":
+                new = configedit.set_allow(text, val("allow").splitlines())
+                msg = "Saved allowed destinations."
+            elif op == "raw-save":
+                new = val("text").replace("\r\n", "\n")
+                try:
+                    configedit.save(path, new, rev)
+                except (ConfigError, tomllib.TOMLDecodeError, configedit.EditError) as e:
+                    return self.get_config_raw({}, text=new, error=f"Not saved: {e}")
+                return redirect("/config/raw", "Saved." if new != text else "No changes.")
+            elif op == "restore":
+                match = [b for b in configedit.backups(path) if b.name == val("backup")]
+                if not match:
+                    raise configedit.EditError("no such backup")
+                new = match[0].read_text()
+                msg = f"Restored {val('backup')}."
+            else:
+                return redirect(back, "Unknown action.", bad=True)
+            configedit.save(path, new, rev)
+        except (configedit.EditError, ConfigError, tomllib.TOMLDecodeError) as e:
+            return redirect(back, f"Not saved: {e}", bad=True)
+        return redirect(back, msg)
 
     # --- actions ----------------------------------------------------------------------------
 

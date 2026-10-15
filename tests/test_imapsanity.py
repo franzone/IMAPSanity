@@ -4,6 +4,7 @@ import fcntl
 import io
 import json
 import os
+import re
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -626,6 +627,102 @@ class TestQuarantineReview(QuarantineHelpers, ImapFixture, Base):
         self.assertEqual(quarantine.rescue(cfg, self.idx, ["<gone@test>"], out=quiet), {})
 
 
+
+EDIT_CONFIG_TAIL = """
+# --- shops ---
+
+# deals: keep one
+[[match]]
+sender = "@shop.com"   # the big one
+filer = "One"
+
+[[match]]
+subject = "receipt"
+filer = "VIP"
+"""
+
+
+class TestConfigEdit(Base):
+    """Editing config.toml in place: only the touched lines change, saves are validated and backed up."""
+
+    def setUp(self):
+        super().setUp()
+        from imapsanity import configedit
+        self.ce = configedit
+        self.env.cfg_path.write_text(self.env.cfg_path.read_text() + EDIT_CONFIG_TAIL)
+        self.text = self.env.cfg_path.read_text()
+
+    def rules(self, text):
+        import tomllib
+        return [(m.get("sender"), m.get("subject"), m["filer"]) for m in tomllib.loads(text)["match"]]
+
+    def test_rule_edits_keep_comments(self):
+        t = self.ce.update_rule(self.text, 4, "@shop.co.uk", "sale", "VIP")
+        self.assertIn('sender = "@shop.co.uk"   # the big one\nsubject = "sale"\nfiler = "VIP"\n', t)
+        self.assertIn("# --- shops ---\n\n# deals: keep one\n[[match]]", t)
+        self.assertEqual(self.rules(t)[3], ("@shop.co.uk", "sale", "VIP"))
+        t = self.ce.update_rule(t, 4, "@shop.co.uk", "", "VIP")
+        self.assertEqual(self.rules(t)[3], ("@shop.co.uk", None, "VIP"))
+
+        moved = self.ce.move_rule(self.text, 4, 1)   # its comment travels with it
+        self.assertEqual(self.rules(moved)[0], ("@shop.com", None, "One"))
+        self.assertLess(moved.index("# deals: keep one"), moved.index('sender = "mom@family.com"'))
+        self.assertIn("# --- shops ---", moved)
+        self.assertEqual(sorted(map(str, self.rules(moved))), sorted(map(str, self.rules(self.text))))
+        self.assertEqual(self.rules(self.ce.move_rule(self.text, 1, 5))[-1], ("mom@family.com", None, "VIP"))
+
+        gone = self.ce.delete_rule(self.text, 4)
+        self.assertNotIn("# deals: keep one", gone)
+        self.assertIn("# --- shops ---", gone)
+        self.assertNotIn("\n\n\n", gone)
+        self.assertEqual(len(self.rules(gone)), 4)
+        self.assertEqual(self.ce.delete_rule(self.ce.add_rule(self.text, "z@z.com", "", "One"), 6), self.text)
+
+        added = self.ce.add_rule(self.text, ' "quoted" \\ ', "", "VIP", 2)
+        self.assertEqual(self.rules(added)[1], ('"quoted" \\', None, "VIP"))
+        self.assertEqual(self.rules(self.ce.add_rule(self.text, "z@z.com", "", "One"))[-1], ("z@z.com", None, "One"))
+        with self.assertRaises(self.ce.EditError):
+            self.ce.add_rule(self.text, "a\nb", "", "VIP")
+        with self.assertRaises(self.ce.EditError):
+            self.ce.delete_rule(self.text, 99)
+
+    def test_filers_and_destinations(self):
+        t = self.ce.add_filer(self.text, "Twenty", "IMAPSanity/Twenty", "20")
+        self.assertIn('[filers.Twenty]\nfolder = "IMAPSanity/Twenty"\nkeep = 20\n', t)
+        t = self.ce.update_filer(t, "Twenty", "IMAPSanity/XX", "all")
+        self.assertIn('[filers.Twenty]\nfolder = "IMAPSanity/XX"\nkeep = "all"\n', t)
+        with self.assertRaisesRegex(self.ce.EditError, "still used by match #2"):
+            self.ce.delete_filer(t, "One")
+        self.assertNotIn("Twenty", self.ce.delete_filer(t, "Twenty"))
+        for bad in (("Two words", "x", "1"), ("VIP", "x", "1"), ("New", "x", "lots")):
+            with self.assertRaises(self.ce.EditError):
+                self.ce.add_filer(t, *bad)
+        t = self.ce.set_allow(self.text, ["Filtered/News", "Local/Done", " New/Place ", ""])
+        self.assertIn('allow = ["Filtered/News", "Local/Done", "New/Place"]\n', t)
+
+    def test_save_validates_backs_up_and_checks_revision(self):
+        path = self.env.cfg_path
+        _, rev = self.ce.read(path)
+        bad = self.ce.add_rule(self.text, "x@x.com", "", "Nope")   # unknown filer: valid TOML, invalid config
+        with self.assertRaisesRegex(ConfigError, "unknown filer"):
+            self.ce.save(path, bad, rev)
+        self.assertEqual(path.read_text(), self.text)
+        self.assertEqual(self.ce.backups(path), [])
+        good = self.ce.add_rule(self.text, "x@x.com", "", "VIP")
+        self.ce.save(path, good, rev)
+        self.assertEqual(path.read_text(), good)
+        self.assertEqual([b.read_text() for b in self.ce.backups(path)], [self.text])
+        with self.assertRaisesRegex(self.ce.EditError, "changed since"):
+            self.ce.save(path, self.text, rev)
+        self.assertEqual(load(path).matches[-1].sender, "x@x.com")
+
+    def test_refuses_what_it_cannot_map(self):
+        tricky = self.text.replace('[ai]\nenabled = true', '[ai]\nenabled = true\ninstructions = """\n[[match]]\n"""')
+        self.assertNotEqual(tricky, self.text)
+        with self.assertRaisesRegex(self.ce.EditError, "raw editor"):
+            self.ce.delete_rule(tricky, 1)
+
+
 class TestDashboard(QuarantineHelpers, ImapFixture, Base):
     def setUp(self):
         super().setUp()
@@ -674,7 +771,7 @@ class TestDashboard(QuarantineHelpers, ImapFixture, Base):
         self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
         # the one script is the fixed Check all / Clear all helper, allowed only by its hash
         from imapsanity import dashboard
-        import base64, hashlib, re
+        import base64, hashlib
         scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
         self.assertEqual(scripts, [dashboard.SELECT_JS])
         digest = base64.b64encode(hashlib.sha256(scripts[0].encode()).digest()).decode()
@@ -717,6 +814,37 @@ class TestDashboard(QuarantineHelpers, ImapFixture, Base):
         self.assertEqual(self.idx.confirmed_junk(), {m})
         self.assertIn("Confirmed junk · 1", self.http("GET", "/a/_/quarantine")[2])
         self.assertIn("Nothing+selected", self.http("POST", "/a/_/quarantine", {"action": "junk"})[1]["Location"])
+
+    def test_config_editor(self):
+        for path in ("/config", "/config/rules", "/config/rules?q=deals&page=9", "/config/raw"):
+            status, _, page = self.http("GET", path)
+            self.assertEqual(status, 200, path)
+        page = self.http("GET", "/config/rules?filer=One")[2]
+        self.assertIn('value="@deals.com"', page)
+        self.assertNotIn('value="mom@family.com"', page)
+        rev = re.search(r'name="rev" value="([0-9a-f]+)"', page).group(1)
+        self.put("INBOX", "Deals <x@deals.com>", "50% off")
+        self.idx.update(verbose=False)
+        status, _, page = self.http("POST", "/config", {"op": "preview-rule", "rev": rev, "sender": "deals.com",
+                                                        "subject": "", "filer": "VIP", "position": "1"})
+        self.assertEqual(status, 200)
+        self.assertIn("would be filed by this rule", page)
+        self.assertIn("50% off", page)
+        status, headers, _ = self.http("POST", "/config", {"op": "add-rule", "rev": rev, "sender": "new@x.com",
+                                                           "subject": "", "filer": "VIP", "position": "",
+                                                           "back": "/config/rules?filer=One"})
+        self.assertEqual(status, 303)
+        self.assertTrue(headers["Location"].startswith("/config/rules?filer=One&msg=Added+rule"))
+        self.assertEqual(self.env.cfg().matches[-1].sender, "new@x.com")
+        stale = self.http("POST", "/config", {"op": "delete-rule", "rev": rev, "n": "1", "back": "https://evil.example"})
+        self.assertTrue(stale[1]["Location"].startswith("/config?msg=Not+saved"))
+        before = self.env.cfg_path.read_text()
+        rev = re.search(r'name="rev" value="([0-9a-f]+)"', self.http("GET", "/config/raw")[2]).group(1)
+        status, _, page = self.http("POST", "/config", {"op": "raw-save", "rev": rev, "text": before + "\n[oops\n"})
+        self.assertEqual(status, 200)
+        self.assertIn("Not saved", page)
+        self.assertIn("[oops", page)   # what you typed is still there
+        self.assertEqual(self.env.cfg_path.read_text(), before)
 
     def test_busy_while_cycle_holds_the_lock(self):
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
