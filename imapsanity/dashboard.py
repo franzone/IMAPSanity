@@ -5,14 +5,17 @@ Local only, by construction:
   * binds 127.0.0.1 and refuses any other Host header (DNS rebinding);
   * every request needs a cookie set from the one-time link printed at startup, and POSTs must come
     from the dashboard's own pages (SameSite=Strict cookie, Origin / Sec-Fetch-Site checks);
-  * pages carry no JavaScript and a Content-Security-Policy that forbids it, and every value taken
-    from mail (subjects, senders, snippets) is HTML-escaped.
+  * the only JavaScript is the fixed SELECT_JS below (Check all / Clear all), allowed by its hash in
+    the Content-Security-Policy, which forbids every other script; every value taken from mail
+    (subjects, senders, snippets) is HTML-escaped.
 Every change goes through the same code the CLI uses (guards, journal, undo), under the account's
 run lock, so a launchd `cycle` and the dashboard never move mail at the same time.
 """
 
 import argparse
+import base64
 import contextlib
+import hashlib
 import hmac
 import html
 import io
@@ -77,6 +80,7 @@ td.nowrap { white-space:nowrap; } .snippet { color:var(--muted); font-size:13px;
 button { font:inherit; padding:6px 12px; border-radius:7px; border:1px solid var(--line); background:var(--panel);
   color:var(--text); cursor:pointer; } button.primary { background:var(--accent); border-color:var(--accent); color:var(--bg); }
 button.danger { color:var(--bad); border-color:var(--bad); }
+button.small { padding:2px 8px; font-size:12px; }
 input[type=text] { font:inherit; padding:6px 8px; border-radius:7px; border:1px solid var(--line);
   background:var(--panel); color:var(--text); min-width:260px; }
 details > summary { cursor:pointer; margin:8px 0; color:var(--accent); }
@@ -86,7 +90,14 @@ pre { background:var(--panel); border:1px solid var(--line); border-radius:8px; 
 @media (max-width:640px) { td.hide-sm, th.hide-sm { display:none; } }
 """
 
-CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+# Check all / Clear all for a quarantine group: ticks or clears every message box in the button's form.
+SELECT_JS = ("document.addEventListener('click',function(e){var b=e.target.closest('button[data-check]');"
+             "if(!b)return;b.form.querySelectorAll('input[name=msgid][type=checkbox]').forEach("
+             "function(c){c.checked=b.dataset.check==='1';});});")
+SELECT_JS_HASH = base64.b64encode(hashlib.sha256(SELECT_JS.encode()).digest()).decode()
+
+CSP = (f"default-src 'none'; script-src 'sha256-{SELECT_JS_HASH}'; style-src 'unsafe-inline'; "
+       "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 
 
 def h(value):
@@ -197,7 +208,7 @@ class App:
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>{h(title)} · IMAPSanity</title>
 <style>{CSS}</style></head><body>
 <header class="top"><strong>IMAPSanity</strong><nav>{"".join(nav)}</nav>{switch}</header>
-<main>{flash}<h1>{h(title)}</h1>{body}</main></body></html>""")
+<main>{flash}<h1>{h(title)}</h1>{body}</main><script>{SELECT_JS}</script></body></html>""")
 
     # --- routing ----------------------------------------------------------------------
 
@@ -327,6 +338,8 @@ class App:
                        '<button name="action" value="keep-sender">Rescue + keep sender</button>')
         return f"""<div class="group {tier}"><form method="post" action="{base}">
 <h3>{h(g['sender'])} <span class="muted">· {len(g['items'])}</span></h3><div class="chips">{chips}</div>
+<div class="row"><button type="button" class="small" data-check="1">Check all</button>
+<button type="button" class="small" data-check="0">Clear all</button></div>
 <table><tr><th></th><th>Date</th><th>Subject</th><th class="hide-sm">Why it's here</th></tr>{"".join(rows)}</table>
 <div class="row">{buttons}</div></form></div>"""
 
