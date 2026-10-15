@@ -580,7 +580,7 @@ def make_handler(app):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Security-Policy", CSP)
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Referrer-Policy", "same-origin")   # no-referrer makes form POSTs send "Origin: null"
             self.send_header("Cache-Control", "no-store")
             for k, v in extra_headers:
                 self.send_header(k, v)
@@ -595,10 +595,14 @@ def make_handler(app):
             return False
 
         def _same_origin(self):
+            # Sec-Fetch-Site is set by the browser and can't be forged by a page, so it decides when
+            # present. Origin is the fallback for browsers without it; a "null" Origin (sent for
+            # privacy, e.g. under some referrer policies) proves nothing, so it's refused there.
+            site = self.headers.get("Sec-Fetch-Site")
+            if site is not None:
+                return site in ("same-origin", "none")
             origin = self.headers.get("Origin")
-            if origin and origin != f"http://{self.headers.get('Host')}":
-                return False
-            return self.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
+            return origin is None or origin == f"http://{self.headers.get('Host')}"
 
         def _handle(self, method):
             if self.headers.get("Host") not in allowed_hosts:
