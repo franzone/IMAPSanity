@@ -602,6 +602,19 @@ class TestQuarantineReview(QuarantineHelpers, ImapFixture, Base):
         self.assertEqual(guards.action_problem(cfg, plan.make_action(row, "Quarantine", "rule", "x", True)),
                          "kept message cannot be quarantined")
 
+    def test_move_to_another_folder(self):
+        old = self.put("INBOX", "sale@deals.com", "old", days_ago=3)
+        self.put("INBOX", "sale@deals.com", "new")
+        apply.apply_plan(self.cfg, self.idx, self.make_plan(), execute=True, out=quiet)   # keep-last-1
+        self.mirror()
+        self.assertNotIn("Quarantine", quarantine.move_targets(self.cfg))
+        self.assertEqual(quarantine.rescue(self.cfg, self.idx, [old], dest="Nowhere", out=quiet), {})
+        self.assertEqual(quarantine.rescue(self.cfg, self.idx, [old], dest="Filtered/News", out=quiet), {"moved": 1})
+        self.assertIn(old, [m for m, _ in self.conn.boxes["INBOX.Filtered.News"].values()])
+        self.mirror()
+        self.assertIn(old, self.env.cfg().kept_msgids)
+        self.assertEqual(quarantine.items(self.cfg, self.idx), [])
+
     def test_rescue_and_keep_sender(self):
         m = self.put("INBOX", "Pat <pat@co.com>", "invoice")
         self.quarantine(m, source="ai")
@@ -694,6 +707,10 @@ class TestDashboard(QuarantineHelpers, ImapFixture, Base):
         self.assertIn("Confirm all 1 as junk", page)
         self.assertIn('data-check="1">Check all</button>', page)
         self.assertIn('data-check="0">Clear all</button>', page)
+        self.assertIn('<button name="action" value="move">Move to folder</button>', page)
+        self.assertNotIn('<option value="Quarantine">', page)
+        self.assertIn("Pick+a+folder", self.http("POST", "/a/_/quarantine",
+                                                 {"action": "move", "dest": "Quarantine", "msgid": [m]})[1]["Location"])
         status, headers, _ = self.http("POST", "/a/_/quarantine", {"action": "junk", "msgid": [m]})
         self.assertEqual(status, 303)
         self.assertIn("Confirmed+as+junk", headers["Location"])

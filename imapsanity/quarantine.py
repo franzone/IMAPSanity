@@ -1,5 +1,6 @@
 """The quarantine, for review: why each message is there, how likely it is to be a mistake, and the
-two ways out: rescue (move it back and keep it) or confirm it as junk (only confirmed junk is purged).
+ways out: rescue (move it back, or to another folder, and keep it) or confirm it as junk (only
+confirmed junk is purged).
 
 Risk is a few cheap signals, not a model. With why a message was quarantined, they sort the
 quarantine into three tiers so the handful worth a careful look aren't buried in bulk mail:
@@ -117,13 +118,23 @@ def groups(entries):
     return sorted(out, key=lambda g: (-g["score"], len(g["items"]), g["sender"]))
 
 
-def rescue(cfg, idx, msgids, keep_sender=False, out=print):
-    """Move messages back where imapsanity took them from, and keep them (or their senders) from now on.
+def move_targets(cfg):
+    """Folders the dashboard offers for "Move to": every allowed destination except the quarantine."""
+    return sorted(f for f in cfg.allow_destinations if f != cfg.safety.quarantine)
+
+
+def rescue(cfg, idx, msgids, keep_sender=False, dest=None, out=print):
+    """Move messages back where imapsanity took them from (or to `dest`, an allowed destination), and
+    keep them (or their senders) from now on, so keep-last-N never trims them back into the quarantine.
 
     The exception is saved before the move, so even a half-failed move is never re-quarantined.
     Returns a Counter of move statuses.
     """
     q = cfg.safety.quarantine
+    if dest is not None and dest not in move_targets(cfg):
+        out(f"can't move to {dest}: not an allowed destination")
+        return Counter()
+    why = f"moved to {dest} in the dashboard" if dest else "rescued in the dashboard"
     by_msgid = {it["msgid"]: it for it in items(cfg, idx)}
     actions = []
     for m in msgids:
@@ -131,12 +142,12 @@ def rescue(cfg, idx, msgids, keep_sender=False, out=print):
         if it is None:
             out(f"no longer in {q}: {m}")
             continue
-        dest = it["origin"] or cfg.rules_source_folders[0]
-        if cfg.backend_for(q) != cfg.backend_for(dest):
-            out(f"can't rescue to {dest}: it and {q} use different backends; move it by hand")
+        to = dest or it["origin"] or cfg.rules_source_folders[0]
+        if cfg.backend_for(q) != cfg.backend_for(to):
+            out(f"can't rescue to {to}: it and {q} use different backends; move it by hand")
             continue
-        actions.append({"id": f"r{len(actions) + 1:04d}", "msgid": m, "folder": q, "dest": dest,
-                        "key": it["key"], "source": "rescue", "why": "rescued in the dashboard",
+        actions.append({"id": f"r{len(actions) + 1:04d}", "msgid": m, "folder": q, "dest": to,
+                        "key": it["key"], "source": "rescue", "why": why,
                         "from": it["from"], "addr": it["addr"], "subject": it["subject"]})
     if not actions:
         return Counter()
