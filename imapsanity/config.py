@@ -175,10 +175,15 @@ ACCOUNT_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 PER_ACCOUNT_ONLY = [("paths", "maildir"), ("mbsync", "pull"), ("mbsync", "push"), ("backends", "maildir_folders")]
 
 
+def config_path(path=None):
+    """The config file: `path`, else $IMAPSANITY_CONFIG, else config.toml in the checkout."""
+    return Path(path or os.environ.get("IMAPSANITY_CONFIG") or DEFAULT_CONFIG)
+
+
 def load_all(path=None):
     """One Config per account. A single [account] table gives one Config named "" that
     behaves exactly as before; [[account]] entries are each merged over the shared sections."""
-    path = Path(path or os.environ.get("IMAPSANITY_CONFIG") or DEFAULT_CONFIG)
+    path = config_path(path)
     if not path.exists():
         raise ConfigError(f"config not found: {path} (copy config.sample.toml or run tools/migrate_yaml.py)")
     with open(path, "rb") as f:
