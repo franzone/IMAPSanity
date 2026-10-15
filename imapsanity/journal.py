@@ -12,8 +12,15 @@ def journal_dir(cfg):
     return d
 
 
-def new_run_id(kind):
-    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{kind}"
+def new_run_id(kind, cfg=None):
+    """Timestamped run id. With cfg, a second run in the same second gets a counter (…-112409.2-apply),
+    which still sorts after the first."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id, n = f"{stamp}-{kind}", 1
+    while cfg is not None and (journal_dir(cfg) / f"{run_id}.jsonl").exists():
+        n += 1
+        run_id = f"{stamp}.{n}-{kind}"
+    return run_id
 
 
 class Journal:
@@ -59,6 +66,22 @@ def read(cfg, run_id):
 
 def all_runs(cfg):
     return sorted(p.stem for p in journal_dir(cfg).glob("*.jsonl"))
+
+
+def entries(cfg):
+    """Every journal entry, oldest run first."""
+    for run in all_runs(cfg):
+        yield from read(cfg, run)
+
+
+def last_moves(cfg):
+    """Latest moved/purged entry per Message-ID: where imapsanity last put each message."""
+    last = {}
+    for e in entries(cfg):
+        if e["status"] in ("moved", "purged") and e.get("msgid"):
+            if e["msgid"] not in last or e["ts"] >= last[e["msgid"]]["ts"]:
+                last[e["msgid"]] = e
+    return last
 
 
 def final_states(entries):

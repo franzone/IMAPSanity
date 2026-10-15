@@ -145,6 +145,7 @@ def candidates(cfg, idx, exclude=()):
     return [r for r in unmatched(cfg, idx, cfg.ai.folders)
             if (r["folder"], r["msgid"]) not in exclude
             and not cfg.is_protected_sender(r["from_raw"])
+            and r["msgid"] not in cfg.kept_msgids
             and not ("F" in r["flags"] and cfg.safety.skip_flagged)]
 
 

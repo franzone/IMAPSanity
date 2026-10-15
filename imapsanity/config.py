@@ -7,6 +7,8 @@ import tomllib
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 
+from . import exceptions
+
 REPO_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_DIR / "config.toml"
 
@@ -128,6 +130,7 @@ class Config:
     typesafe: TypeSafe
     filers: dict
     matches: list
+    exceptions: dict = field(default_factory=exceptions.empty)   # dashboard keeps, from <state>/exceptions.json
 
     def backend_for(self, folder):
         return "maildir" if folder in self.maildir_folders else "imap"
@@ -142,7 +145,12 @@ class Config:
         pats = list(self.safety.protected_senders)
         protect = set(self.safety.protect_filers)
         pats += [m.sender for m in self.matches if m.filer in protect and m.sender]
+        pats += list(self.exceptions["senders"])
         return pats
+
+    @property
+    def kept_msgids(self):
+        return set(self.exceptions["messages"])
 
 
 def _section(raw, name, cls):
@@ -328,6 +336,7 @@ def _build(path, raw, name):
         filers=filers,
         matches=matches,
     )
+    cfg.exceptions = exceptions.load(cfg.state_dir)
     _validate(cfg)
     return cfg
 

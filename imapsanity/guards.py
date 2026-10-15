@@ -26,8 +26,12 @@ def action_problem(cfg, a):
             return f"destination {a['dest']!r} not allowed for AI"
         if cfg.is_protected_sender(a["from"]):
             return "AI may not act on protected senders"
+        if a["msgid"] in cfg.kept_msgids:
+            return "AI may not act on kept messages"
     if a["dest"] == s.quarantine and cfg.is_protected_sender(a["from"]):
         return "protected sender cannot be quarantined"
+    if a["dest"] == s.quarantine and a["msgid"] in cfg.kept_msgids:
+        return "kept message cannot be quarantined"
     if cfg.backend_for(a["folder"]) != cfg.backend_for(a["dest"]):
         return "source and destination use different backends (both must be maildir_folders, or neither)"
     return None

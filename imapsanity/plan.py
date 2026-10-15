@@ -93,29 +93,34 @@ def summarize(plan, out=print):
     out(f"{'source':6} {'approved':>9}  move")
     for (source, folder, dest), (n, ok) in sorted(groups.items()):
         out(f"{source:6} {ok:>4}/{n:<4}  {folder} -> {dest}")
-    pending = sum(1 for a in plan["actions"] if a["source"] == "ai" and not a["approved"]
-                  and a.get("decision") != "rejected")
-    if pending:
-        out(f"\n{pending} AI proposal(s) await review: imapsanity review")
+    waiting = len(pending(plan))
+    if waiting:
+        out(f"\n{waiting} AI proposal(s) await review: imapsanity review")
+
+
+def pending(plan):
+    """AI proposals nobody has approved or rejected yet."""
+    return [a for a in plan["actions"]
+            if a["source"] == "ai" and not a["approved"] and a.get("decision") != "rejected"]
+
+
+def decide(idx, actions, decision):
+    """Approve or reject AI proposals; rejections are remembered so they're never proposed again."""
+    for a in actions:
+        a["approved"] = decision == "approved"
+        a["decision"] = decision
+        idx.record_decision(a["msgid"], a["dest"], decision)
 
 
 def review(cfg, idx, path, inp=input, out=print):
     """Interactively approve/reject AI proposals, grouped by (dest, sender)."""
     plan = load(path)
-    pending = [a for a in plan["actions"]
-               if a["source"] == "ai" and not a["approved"] and a.get("decision") != "rejected"]
     groups = defaultdict(list)
-    for a in pending:
+    for a in pending(plan):
         groups[(a["dest"], a["addr"] or a["from"])].append(a)
     if not groups:
         out("no AI proposals awaiting review")
         return
-
-    def decide(actions, decision):
-        for a in actions:
-            a["approved"] = decision == "approved"
-            a["decision"] = decision
-            idx.record_decision(a["msgid"], a["dest"], decision)
 
     items = sorted(groups.items(), key=lambda kv: (kv[0][0], -len(kv[1])))
     try:
@@ -134,14 +139,14 @@ def review(cfg, idx, path, inp=input, out=print):
             if choice == "q":
                 break
             if choice == "a":
-                decide(actions, "approved")
+                decide(idx, actions, "approved")
             elif choice == "r":
-                decide(actions, "rejected")
+                decide(idx, actions, "rejected")
             elif choice == "i":
                 for a in actions:
                     c = inp(f"    {a['date']} {a['subject'][:70]}  [y/n/s] > ").strip().lower()
                     if c in ("y", "n"):
-                        decide([a], "approved" if c == "y" else "rejected")
+                        decide(idx, [a], "approved" if c == "y" else "rejected")
     finally:
         save(cfg, plan, path)
         approved = sum(1 for a in plan["actions"] if a["approved"])
