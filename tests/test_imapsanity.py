@@ -665,6 +665,15 @@ class TestDashboard(QuarantineHelpers, ImapFixture, Base):
                                    headers={"Origin": "http://evil.example"})[0], 403)
         self.assertEqual(self.http("POST", q, {"action": "junk", "msgid": "x"},
                                    headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
+        self.assertEqual(self.http("POST", q, {"action": "junk", "msgid": "x"},
+                                   headers={"Origin": "null"})[0], 403)
+        # what a browser sends for a form on the dashboard's own page
+        self.assertEqual(self.http("POST", q, {"action": "junk"},
+                                   headers={"Origin": "null", "Sec-Fetch-Site": "same-origin"})[0], 303)
+        self.assertEqual(self.http("POST", q, {"action": "junk"},
+                                   headers={"Origin": self.base, "Sec-Fetch-Site": "same-origin"})[0], 303)
+        self.assertEqual(self.http("POST", q, {"action": "junk", "msgid": "x"},
+                                   headers={"Origin": self.base, "Sec-Fetch-Site": "cross-site"})[0], 403)
         self.assertEqual(self.http("GET", "/a/nobody/quarantine")[0], 404)
 
     def test_quarantine_page_escapes_and_confirms(self):
