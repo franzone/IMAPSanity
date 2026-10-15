@@ -81,6 +81,8 @@ button { font:inherit; padding:6px 12px; border-radius:7px; border:1px solid var
   color:var(--text); cursor:pointer; } button.primary { background:var(--accent); border-color:var(--accent); color:var(--bg); }
 button.danger { color:var(--bad); border-color:var(--bad); }
 button.small { padding:2px 8px; font-size:12px; }
+select { font:inherit; padding:5px 8px; border-radius:7px; border:1px solid var(--line);
+  background:var(--panel); color:var(--text); }
 input[type=text] { font:inherit; padding:6px 8px; border-radius:7px; border:1px solid var(--line);
   background:var(--panel); color:var(--text); min-width:260px; }
 details > summary { cursor:pointer; margin:8px 0; color:var(--accent); }
@@ -282,10 +284,13 @@ class App:
         todo = quarantine.groups([i for i in ours if not i["confirmed"]])
         done = quarantine.groups([i for i in ours if i["confirmed"]])
         manual = [i for i in its if not i["ours"]]
+        targets = quarantine.move_targets(cfg)
 
         parts = [f'<p class="hint">{len(ours)} message(s) imapsanity quarantined. Purge only deletes the ones you '
                  f'confirm as junk here. <b>Rescue</b> moves a message back where it came from and keeps it from '
-                 f'being quarantined again; <b>Rescue + keep sender</b> does that for everything from the sender.</p>']
+                 f'being quarantined again; <b>Rescue + keep sender</b> does that for everything from the sender; '
+                 f'<b>Move to folder</b> rescues it into a folder you pick (say, when a rule filed it in the wrong '
+                 f'one: fix the rule in config.toml too).</p>']
         if not todo:
             parts.append('<p class="ok">Nothing waiting for review.</p>')
         for tier in ("careful", "glance", "rules"):
@@ -294,7 +299,7 @@ class App:
                 continue
             title, hint = TIER_TITLES[tier]
             n = sum(len(g["items"]) for g in gs)
-            blocks = "".join(self._qgroup(base, g, tier) for g in gs)
+            blocks = "".join(self._qgroup(base, g, tier, targets) for g in gs)
             head = f"<h2>{title} · {len(gs)} sender(s), {n} message(s)</h2><p class='hint'>{hint}</p>"
             if tier == "rules":
                 # Your own rules put these here and anything with a strong signal is listed above,
@@ -307,7 +312,7 @@ class App:
                 parts.append(head + blocks)
         if done:
             n = sum(len(g["items"]) for g in done)
-            blocks = "".join(self._qgroup(base, g, "done") for g in done)
+            blocks = "".join(self._qgroup(base, g, "done", targets) for g in done)
             parts.append(f"<h2>Confirmed junk · {n}</h2><p class='hint'>These are what <code>purge</code> deletes once "
                          f"they're old enough.</p><details><summary>Show</summary>{blocks}</details>")
         if manual:
@@ -318,7 +323,7 @@ class App:
                          f"<table>{rows}</table></details>")
         return self.page("Quarantine", "".join(parts), cfg, "quarantine", query)
 
-    def _qgroup(self, base, g, tier):
+    def _qgroup(self, base, g, tier, targets):
         checked = "" if tier == "careful" else " checked"
         rows = []
         for i in g["items"]:
@@ -335,7 +340,10 @@ class App:
         else:
             buttons = ('<button name="action" value="junk" class="primary">Confirm junk</button>'
                        '<button name="action" value="rescue">Rescue</button>'
-                       '<button name="action" value="keep-sender">Rescue + keep sender</button>')
+                       '<button name="action" value="keep-sender">Rescue + keep sender</button>'
+                       '<span class="muted">or</span><select name="dest" aria-label="folder">'
+                       + "".join(f'<option value="{h(t)}">{h(t)}</option>' for t in targets)
+                       + '</select><button name="action" value="move">Move to folder</button>')
         return f"""<div class="group {tier}"><form method="post" action="{base}">
 <h3>{h(g['sender'])} <span class="muted">· {len(g['items'])}</span></h3><div class="chips">{chips}</div>
 <div class="row"><button type="button" class="small" data-check="1">Check all</button>
@@ -354,13 +362,19 @@ class App:
                 idx.confirm_junk(msgids, confirmed=action == "junk")
                 verb = "Confirmed as junk" if action == "junk" else "Back in review"
                 return redirect(base, f"{verb}: {len(msgids)} message(s).")
-            if action in ("rescue", "keep-sender"):
+            if action in ("rescue", "keep-sender", "move"):
+                dest = (form.get("dest") or [""])[0] if action == "move" else None
+                if action == "move" and dest not in quarantine.move_targets(cfg):
+                    return redirect(base, "Pick a folder to move to.", bad=True)
                 tally = Counter()
                 self.capture(lambda: tally.update(
-                    quarantine.rescue(cfg, idx, msgids, keep_sender=action == "keep-sender")))
+                    quarantine.rescue(cfg, idx, msgids, keep_sender=action == "keep-sender", dest=dest)))
                 moved = tally.get("moved", 0)
                 problems = {k: v for k, v in tally.items() if k != "moved"}
-                msg = f"Rescued {moved} message(s)" + (" and kept their sender(s)." if action == "keep-sender" else ".")
+                if action == "move":
+                    msg = f"Moved {moved} message(s) to {dest}."
+                else:
+                    msg = f"Rescued {moved} message(s)" + (" and kept their sender(s)." if action == "keep-sender" else ".")
                 if problems:
                     msg += " Not moved: " + ", ".join(f"{k} {v}" for k, v in problems.items()) + " (see Runs)."
                 return redirect(base, msg, bad=bool(problems))
