@@ -10,7 +10,7 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
 
-from . import ai, apply, guards, journal, plan, rules, shadow, sync, typesafe
+from . import ai, apply, guards, journal, plan, quarantine, rules, shadow, sync, typesafe
 from .backends import BackendError
 from .backends.imap import ImapBackend
 from .config import ConfigError, load_all, pick
@@ -91,7 +91,7 @@ def cmd_runs(cfg, idx, args):
 
 
 def cmd_purge(cfg, idx, args):
-    confirmed = None if args.include_unreviewed else idx.confirmed_junk()
+    confirmed = None if args.include_unreviewed else quarantine.purgeable(cfg, idx)
     return apply.purge(cfg, args.older_than, args.execute, confirmed=confirmed)
 
 
@@ -102,7 +102,8 @@ def cmd_sync(cfg, idx, args):
 
 
 def cmd_cycle(cfg, idx, args):
-    """Unattended run (launchd): pull, rules-only plan, apply, push, pull.
+    """Unattended run (launchd): pull, rules-only plan, apply, purge old keep-last-N trims (if
+    [safety].purge_rule_trims_days is set), push, pull.
 
     Its plans are saved as cycle-*.json so they never shadow the manual plan that
     `review` / `apply` pick by default, and empty plans aren't saved at all.
@@ -135,10 +136,16 @@ def cmd_cycle(cfg, idx, args):
         aborted = rc == 2
     # An abort keeps the scale this backlog earned, for the next cycle; anything else clears it.
     idx.set_meta("cycle_backlog_scale", str(scale if aborted else 1))
+    purged = 0
+    try:
+        purged = quarantine.purge_rule_trims(cfg, idx)
+    except (BackendError, OSError) as e:
+        print(f"purge: {e}")
+        rc = rc or 1
     if not aborted:
         if cfg.maildir_folders:
             rc = sync.push(cfg, True) or rc
-        if actions or cfg.maildir_folders:
+        if actions or cfg.maildir_folders or purged:
             rc = sync.pull(cfg, idx, True) or rc
     # The AI step runs even when the rules step aborted, so a blocked backlog doesn't stall it.
     if cfg.auto.mode in ("shadow", "live"):

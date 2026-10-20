@@ -113,17 +113,40 @@ def undo(cfg, run_id, execute, force=False, out=print):
     return 0 if set(tally) <= {"moved"} else 1
 
 
+def purge_candidates(cfg, days):
+    """Journal entries of messages *we* quarantined at least `days` ago and haven't moved since."""
+    q = cfg.safety.quarantine
+    cutoff = time.time() - days * 86400
+    kept = cfg.kept_msgids
+    return [e for e in journal.last_moves(cfg).values()
+            if e["status"] == "moved" and e["to_folder"] == q and e["ts"] <= cutoff and e["msgid"] not in kept]
+
+
+def delete_quarantined(cfg, cands, kind="purge"):
+    """Permanently delete these candidates from the quarantine on the server, journaled. Returns a tally."""
+    q = cfg.safety.quarantine
+    jnl = journal.Journal(cfg, journal.new_run_id(kind, cfg))
+    try:
+        with ImapBackend(cfg) as b:
+            results = b.purge(q, [e["msgid"] for e in cands])
+        by_msgid = {e["msgid"]: e for e in cands}
+        for i, (msgid, status) in enumerate(results, start=1):
+            e = by_msgid[msgid]
+            jnl.write({"id": f"p{i:04d}", "msgid": msgid, "folder": q, "dest": "(deleted)",
+                       "addr": e.get("addr"), "subject": e.get("subject")}, status, "imap")
+    finally:
+        jnl.close()
+    return Counter(s for _, s in results)
+
+
 def purge(cfg, days, execute, inp=input, out=print, confirmed=None):
-    """Permanently delete messages *we* quarantined at least `days` ago. Human-only.
+    """Permanently delete messages *we* quarantined at least `days` ago. Human-only (cycle's
+    automatic purge of keep-last-N trims is quarantine.purge_rule_trims).
 
     `confirmed`: Message-IDs you confirmed as junk in the dashboard; when given, only those are
     deleted, so nothing you never looked at disappears. None deletes everything old enough.
     """
-    q = cfg.safety.quarantine
-    cutoff = time.time() - days * 86400
-    kept = cfg.kept_msgids
-    cands = [e for e in journal.last_moves(cfg).values()
-             if e["status"] == "moved" and e["to_folder"] == q and e["ts"] <= cutoff and e["msgid"] not in kept]
+    cands = purge_candidates(cfg, days)
     if confirmed is not None:
         unreviewed = [e for e in cands if e["msgid"] not in confirmed]
         cands = [e for e in cands if e["msgid"] in confirmed]
@@ -143,16 +166,6 @@ def purge(cfg, days, execute, inp=input, out=print, confirmed=None):
     if inp(f"Type 'PURGE {len(cands)}' to permanently delete: ").strip() != f"PURGE {len(cands)}":
         out("not confirmed; nothing deleted")
         return 2
-    jnl = journal.Journal(cfg, journal.new_run_id("purge", cfg))
-    try:
-        with ImapBackend(cfg) as b:
-            results = b.purge(q, [e["msgid"] for e in cands])
-        by_msgid = {e["msgid"]: e for e in cands}
-        for i, (msgid, status) in enumerate(results, start=1):
-            e = by_msgid[msgid]
-            jnl.write({"id": f"p{i:04d}", "msgid": msgid, "folder": q, "dest": "(deleted)",
-                       "addr": e.get("addr"), "subject": e.get("subject")}, status, "imap")
-    finally:
-        jnl.close()
-    out("purge: " + ", ".join(f"{k} {n}" for k, n in Counter(s for _, s in results).items()))
+    tally = delete_quarantined(cfg, cands)
+    out("purge: " + ", ".join(f"{k} {n}" for k, n in tally.items()))
     return 0

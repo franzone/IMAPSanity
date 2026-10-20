@@ -307,8 +307,11 @@ class App:
         manual = [i for i in its if not i["ours"]]
         targets = quarantine.move_targets(cfg)
 
+        days = cfg.safety.purge_rule_trims_days
+        trims = (f'Extras trimmed by your keep-last-N rules are confirmed automatically and deleted {days:g} day(s) '
+                 f'after they were quarantined; rescue any you want before then. ') if days else ""
         parts = [f'<p class="hint">{len(ours)} message(s) imapsanity quarantined. Purge only deletes the ones you '
-                 f'confirm as junk here. <b>Rescue</b> moves a message back where it came from and keeps it from '
+                 f'confirm as junk here. {trims}<b>Rescue</b> moves a message back where it came from and keeps it from '
                  f'being quarantined again; <b>Rescue + keep sender</b> does that for everything from the sender; '
                  f'<b>Move to folder</b> rescues it into a folder you pick (say, when a rule filed it in the wrong '
                  f'one: fix the rule in config.toml too).</p>']
@@ -320,7 +323,7 @@ class App:
                 continue
             title, hint = TIER_TITLES[tier]
             n = sum(len(g["items"]) for g in gs)
-            blocks = "".join(self._qgroup(base, g, tier, targets) for g in gs)
+            blocks = "".join(self._qgroup(base, g, tier, targets, days) for g in gs)
             head = f"<h2>{title} · {len(gs)} sender(s), {n} message(s)</h2><p class='hint'>{hint}</p>"
             if tier == "rules":
                 # Your own rules put these here and anything with a strong signal is listed above,
@@ -333,9 +336,12 @@ class App:
                 parts.append(head + blocks)
         if done:
             n = sum(len(g["items"]) for g in done)
-            blocks = "".join(self._qgroup(base, g, "done", targets) for g in done)
+            blocks = "".join(self._qgroup(base, g, "done", targets, days) for g in done)
+            auto = sum(1 for g in done for i in g["items"] if i["auto"])
+            how = (f" {auto} of them are keep-last-N trims, deleted automatically {days:g} day(s) after they were "
+                   f"quarantined.") if auto else ""
             parts.append(f"<h2>Confirmed junk · {n}</h2><p class='hint'>These are what <code>purge</code> deletes once "
-                         f"they're old enough.</p><details><summary>Show</summary>{blocks}</details>")
+                         f"they're old enough.{how}</p><details><summary>Show</summary>{blocks}</details>")
         if manual:
             rows = "".join(f"<tr><td class='nowrap'>{h(day(i['date_ts']))}</td><td>{h(i['from'])}</td>"
                            f"<td>{h(i['subject'])}</td></tr>" for i in manual)
@@ -344,27 +350,35 @@ class App:
                          f"<table>{rows}</table></details>")
         return self.page("Quarantine", "".join(parts), cfg, "quarantine", query)
 
-    def _qgroup(self, base, g, tier, targets):
+    def _qgroup(self, base, g, tier, targets, days=0):
         checked = "" if tier == "careful" else " checked"
         rows = []
         for i in g["items"]:
+            when = ""
+            if i.get("auto") and i["quarantined_ts"]:
+                due = i["quarantined_ts"] + days * 86400
+                when = f" · deleted {'at the next cycle' if due <= time.time() else day(due)}"
             snippet = ""
             if tier == "careful":
                 snippet = f'<div class="snippet">{h(read_snippet(i["path"], 240))}</div>'
             rows.append(f"""<tr><td><input type="checkbox" name="msgid" value="{h(i['msgid'])}"{checked}
  aria-label="select"></td><td class="nowrap">{h(day(i['date_ts']))}</td>
 <td>{h(i['subject']) or '<span class="muted">(no subject)</span>'}{snippet}</td>
-<td class="hide-sm">{h(i['why'])}<div class="muted">from {h(i['origin'])} · {h(ago(i['quarantined_ts']))}</div></td></tr>""")
+<td class="hide-sm">{h(i['why'])}<div class="muted">from {h(i['origin'])} · {h(ago(i['quarantined_ts']))}{h(when)}</div></td></tr>""")
         chips = "".join(f'<span class="chip{" warn" if tier == "careful" else ""}">{h(r)}</span>' for r in g["reasons"])
+        move = ('<span class="muted">or</span><select name="dest" aria-label="folder">'
+                + "".join(f'<option value="{h(t)}">{h(t)}</option>' for t in targets)
+                + '</select><button name="action" value="move">Move to folder</button>')
         if tier == "done":
-            buttons = '<button name="action" value="unjunk">Not sure any more: back to review</button>'
+            # Automatic trims can't go back to review (they'd be confirmed again), only out of the quarantine.
+            buttons = ("" if all(i.get("auto") for i in g["items"]) else
+                       '<button name="action" value="unjunk">Not sure any more: back to review</button>')
+            buttons += ('<button name="action" value="rescue">Rescue</button>'
+                        '<button name="action" value="keep-sender">Rescue + keep sender</button>' + move)
         else:
             buttons = ('<button name="action" value="junk" class="primary">Confirm junk</button>'
                        '<button name="action" value="rescue">Rescue</button>'
-                       '<button name="action" value="keep-sender">Rescue + keep sender</button>'
-                       '<span class="muted">or</span><select name="dest" aria-label="folder">'
-                       + "".join(f'<option value="{h(t)}">{h(t)}</option>' for t in targets)
-                       + '</select><button name="action" value="move">Move to folder</button>')
+                       '<button name="action" value="keep-sender">Rescue + keep sender</button>' + move)
         return f"""<div class="group {tier}"><form method="post" action="{base}">
 <h3>{h(g['sender'])} <span class="muted">· {len(g['items'])}</span></h3><div class="chips">{chips}</div>
 <div class="row"><button type="button" class="small" data-check="1">Check all</button>
@@ -825,7 +839,10 @@ header / Subject, ignoring case; a rule with both needs both. Change the number 
                        for op, (label, desc) in self.OPS.items())
         body = (f"<table>{rows}</table><p class='hint'>Purge stays on the command line: "
                 f"<code>imapsanity{' --account ' + h(cfg.name) if cfg.name else ''} purge --older-than 30</code>. "
-                f"It only deletes messages you confirmed as junk in Quarantine.</p>")
+                f"It only deletes messages you confirmed as junk in Quarantine"
+                + (f" (keep-last-N trims count as confirmed; cycle already deletes them after "
+                   f"{cfg.safety.purge_rule_trims_days:g} day(s))" if cfg.safety.purge_rule_trims_days else "")
+                + ".</p>")
         return self.page("Actions", body, cfg, "actions", query)
 
     def post_actions(self, cfg, form):

@@ -43,6 +43,9 @@ skip_flagged = true
 protected_folders = ["Sent", "Sent Messages", "Drafts", "Templates", "Trash", "Deleted Messages"]
 protected_senders = []
 protect_filers = ["VIP"]   # senders matched to these filers are never quarantined or touched by AI
+# Extras trimmed by keep-last-N filers count as confirmed junk and `cycle` deletes them this many
+# days after quarantining them (unless they look personal). 0 = review them in the dashboard.
+purge_rule_trims_days = 0
 
 [destinations]
 # Filer folders and the quarantine are added automatically.
