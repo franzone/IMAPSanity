@@ -7,6 +7,8 @@ quarantine into three tiers so the handful worth a careful look aren't buried in
   careful  a strong signal: you've written to the sender, or TypeSafe thinks it's personal/important
   glance   the AI's judgment, nothing strong (weak signals, e.g. not a mailing list, sort these)
   rules    extras trimmed by your own keep-last-N rules, nothing strong
+With [safety].purge_rule_trims_days set, the "rules" tier needs no review: it counts as confirmed
+junk and cycle deletes it that many days after quarantining it, as keep-last-N always meant.
 """
 
 import email.parser
@@ -92,8 +94,37 @@ def items(cfg, idx):
         }
         item["score"], item["reasons"] = _score(item, known, idx.ts_cached(row["msgid"]) if row["msgid"] else None,
                                                 len(history[item["addr"]]))
+        item["auto"] = auto_junk(cfg, item)
+        item["confirmed"] = item["confirmed"] or item["auto"]
         out.append(item)
     return out
+
+
+def auto_junk(cfg, item):
+    """A keep-last-N trim with no strong signal, while [safety].purge_rule_trims_days is on."""
+    return bool(cfg.safety.purge_rule_trims_days) and item["ours"] and item["source"] == "rule" \
+        and tier(item) == "rules"
+
+
+def purgeable(cfg, idx):
+    """Message-IDs `purge` may delete: the ones you confirmed, plus keep-last-N trims (auto_junk)."""
+    return idx.confirmed_junk() | {i["msgid"] for i in items(cfg, idx) if i["auto"]}
+
+
+def purge_rule_trims(cfg, idx, out=print):
+    """cycle: permanently delete keep-last-N trims quarantined more than purge_rule_trims_days ago.
+    Returns how many were deleted."""
+    days = cfg.safety.purge_rule_trims_days
+    if not days:
+        return 0
+    auto = {i["msgid"] for i in items(cfg, idx) if i["auto"]}
+    cands = [e for e in apply.purge_candidates(cfg, days) if e["msgid"] in auto]
+    if not cands:
+        return 0
+    tally = apply.delete_quarantined(cfg, cands, kind="purge-trims")
+    out(f"purge: keep-last-N trims quarantined over {days:g} day(s) ago: "
+        + ", ".join(f"{k} {n}" for k, n in tally.items()))
+    return tally.get("purged", 0)
 
 
 def tier(items):

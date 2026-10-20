@@ -580,6 +580,33 @@ class TestQuarantineReview(QuarantineHelpers, ImapFixture, Base):
         self.idx.confirm_junk([b], confirmed=False)
         self.assertEqual(self.idx.confirmed_junk(), {a})
 
+    def test_rule_trims_purge_themselves(self):
+        (self.env.mail / "Sent" / "cur" / "1.s,U=1:2,S").write_text(
+            "From: me@example.com\nTo: friend@pal.com\nMessage-ID: <s1@test>\n\nhi\n")
+        trimmed = self.put("INBOX", "news@list.com", "issue 9", extra="List-Id: <news.list.com>\n")
+        friend = self.put("INBOX", "friend@pal.com", "lunch?")
+        self.quarantine(trimmed, friend)
+        pitch = self.put("INBOX", "rep@cold.com", "quick question", extra="List-Id: <x.cold.com>\n")
+        self.quarantine(pitch, source="ai")
+
+        # Off by default: nothing is confirmed or deleted without you.
+        self.assertFalse(any(i["confirmed"] for i in quarantine.items(self.cfg, self.idx)))
+        self.assertEqual(quarantine.purge_rule_trims(self.cfg, self.idx, out=quiet), 0)
+
+        # On: only the trim with no strong signal counts as junk, not the AI's pick or the correspondent's.
+        self.cfg.safety.purge_rule_trims_days = 7
+        items = {i["msgid"]: i for i in quarantine.items(self.cfg, self.idx)}
+        self.assertEqual({m for m, i in items.items() if i["confirmed"]}, {trimmed})
+        self.assertEqual(quarantine.purgeable(self.cfg, self.idx), {trimmed})
+        self.assertEqual(quarantine.purge_rule_trims(self.cfg, self.idx, out=quiet), 0)   # too new
+        self.assertEqual(len(self.conn.boxes["INBOX.Quarantine"]), 3)
+
+        later = time.time() + 8 * 86400
+        with mock.patch("imapsanity.apply.time.time", return_value=later):
+            self.assertEqual(quarantine.purge_rule_trims(self.cfg, self.idx, out=quiet), 1)
+        self.assertEqual({m for m, _ in self.conn.boxes["INBOX.Quarantine"].values()}, {friend, pitch})
+        self.assertTrue(any(r.endswith("-purge-trims") for r in journal.all_runs(self.cfg)))
+
     def test_rescue_keeps_message_out_of_quarantine(self):
         old = self.put("INBOX", "sale@deals.com", "old", days_ago=3)
         self.put("INBOX", "sale@deals.com", "new")

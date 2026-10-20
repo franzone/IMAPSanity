@@ -43,6 +43,9 @@ class Safety:
         "Sent", "Sent Messages", "Drafts", "Templates", "Trash", "Deleted Messages"])
     protected_senders: list = field(default_factory=list)
     protect_filers: list = field(default_factory=lambda: ["VIP"])
+    # >0: extras trimmed by keep-last-N rules (with no sign they're personal) count as confirmed
+    # junk, and cycle permanently deletes them this many days after quarantining them. 0: you review them.
+    purge_rule_trims_days: float = 0
 
 
 @dataclass
