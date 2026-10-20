@@ -308,10 +308,12 @@ class App:
         targets = quarantine.move_targets(cfg)
 
         days = cfg.safety.purge_rule_trims_days
-        trims = (f'Extras trimmed by your keep-last-N rules are confirmed automatically and deleted {days:g} day(s) '
-                 f'after they were quarantined; rescue any you want before then. ') if days else ""
-        parts = [f'<p class="hint">{len(ours)} message(s) imapsanity quarantined. Purge only deletes the ones you '
-                 f'confirm as junk here. {trims}<b>Rescue</b> moves a message back where it came from and keeps it from '
+        trims = (f'Confirmed junk is deleted {days:g} day(s) after it was quarantined, and extras trimmed by your '
+                 f'keep-last-N rules are confirmed automatically; rescue anything you want before then. '
+                 f'<b>Trust this sender\'s trims</b> confirms a sender\'s keep-last-N extras from now on even when '
+                 f'they look personal. ') if days else ""
+        parts = [f'<p class="hint">{len(ours)} message(s) imapsanity quarantined. Only the ones you confirm as junk '
+                 f'here are deleted. {trims}<b>Rescue</b> moves a message back where it came from and keeps it from '
                  f'being quarantined again; <b>Rescue + keep sender</b> does that for everything from the sender; '
                  f'<b>Move to folder</b> rescues it into a folder you pick (say, when a rule filed it in the wrong '
                  f'one: fix the rule in config.toml too).</p>']
@@ -338,10 +340,11 @@ class App:
             n = sum(len(g["items"]) for g in done)
             blocks = "".join(self._qgroup(base, g, "done", targets, days) for g in done)
             auto = sum(1 for g in done for i in g["items"] if i["auto"])
-            how = (f" {auto} of them are keep-last-N trims, deleted automatically {days:g} day(s) after they were "
-                   f"quarantined.") if auto else ""
-            parts.append(f"<h2>Confirmed junk · {n}</h2><p class='hint'>These are what <code>purge</code> deletes once "
-                         f"they're old enough.{how}</p><details><summary>Show</summary>{blocks}</details>")
+            how = (f"The scheduled cycle deletes these {days:g} day(s) after they were quarantined; {auto} are "
+                   f"keep-last-N trims, confirmed automatically." if days else
+                   "These are what <code>purge</code> deletes once they're old enough.")
+            parts.append(f"<h2>Confirmed junk · {n}</h2><p class='hint'>{how}</p>"
+                         f"<details><summary>Show</summary>{blocks}</details>")
         if manual:
             rows = "".join(f"<tr><td class='nowrap'>{h(day(i['date_ts']))}</td><td>{h(i['from'])}</td>"
                            f"<td>{h(i['subject'])}</td></tr>" for i in manual)
@@ -355,7 +358,7 @@ class App:
         rows = []
         for i in g["items"]:
             when = ""
-            if i.get("auto") and i["quarantined_ts"]:
+            if days and i["confirmed"] and i["quarantined_ts"]:
                 due = i["quarantined_ts"] + days * 86400
                 when = f" · deleted {'at the next cycle' if due <= time.time() else day(due)}"
             snippet = ""
@@ -379,7 +382,11 @@ class App:
             buttons = ('<button name="action" value="junk" class="primary">Confirm junk</button>'
                        '<button name="action" value="rescue">Rescue</button>'
                        '<button name="action" value="keep-sender">Rescue + keep sender</button>' + move)
+            if days and g["sender"] and any(i["source"] == "rule" for i in g["items"]):
+                buttons += ('<button name="action" value="trust-trims" title="From now on, this sender\'s '
+                            'keep-last-N extras are confirmed as junk without review">Trust this sender\'s trims</button>')
         return f"""<div class="group {tier}"><form method="post" action="{base}">
+<input type="hidden" name="sender" value="{h(g['sender'])}">
 <h3>{h(g['sender'])} <span class="muted">· {len(g['items'])}</span></h3><div class="chips">{chips}</div>
 <div class="row"><button type="button" class="small" data-check="1">Check all</button>
 <button type="button" class="small" data-check="0">Clear all</button></div>
@@ -390,9 +397,18 @@ class App:
         base = f"/a/{quote(self.slug(cfg))}/quarantine"
         msgids = form.get("msgid", [])
         action = (form.get("action") or [""])[0]
-        if not msgids:
+        if not msgids and action != "trust-trims":
             return redirect(base, "Nothing selected: tick the messages first.", bad=True)
         with self.open(cfg, lock=True) as idx:
+            if action == "trust-trims":
+                sender = (form.get("sender") or [""])[0].strip().lower()
+                if "@" not in sender:
+                    return redirect(base, "No sender to trust.", bad=True)
+                exc = exceptions.load(cfg.state_dir)
+                exceptions.trust_trims(exc, sender, note="trusted in Quarantine")
+                exceptions.save(cfg.state_dir, exc)
+                return redirect(base, f"Trims from {sender} are now confirmed as junk without review "
+                                      f"(undo on the Exceptions page).")
             if action in ("junk", "unjunk"):
                 idx.confirm_junk(msgids, confirmed=action == "junk")
                 verb = "Confirmed as junk" if action == "junk" else "Back in review"
@@ -527,6 +543,8 @@ class App:
 
         senders = "".join(f"<tr><td>{h(k)}</td><td class='nowrap'>{h(day(v.get('added')))}</td><td>{h(v.get('note'))}</td>"
                           f"<td>{remove('senders', k)}</td></tr>" for k, v in sorted(exc["senders"].items()))
+        trusted = "".join(f"<tr><td>{h(k)}</td><td class='nowrap'>{h(day(v.get('added')))}</td><td>{h(v.get('note'))}</td>"
+                          f"<td>{remove('trust_trims', k)}</td></tr>" for k, v in sorted(exc["trust_trims"].items()))
         messages = "".join(f"<tr><td>{h(v.get('addr'))}</td><td>{h(v.get('subject'))}</td>"
                            f"<td class='nowrap'>{h(day(v.get('added')))}</td><td>{remove('messages', k)}</td></tr>"
                            for k, v in sorted(exc["messages"].items(), key=lambda kv: -kv[1].get("added", 0)))
@@ -538,7 +556,11 @@ class App:
  aria-label="sender"><button name="action" value="add" class="primary">Keep sender</button></form>
 {f"<table><tr><th>Sender</th><th>Added</th><th>Note</th><th></th></tr>{senders}</table>" if senders else "<p class='muted'>None.</p>"}
 <h2>Kept messages · {len(exc['messages'])}</h2>
-{f"<table><tr><th>From</th><th>Subject</th><th>Added</th><th></th></tr>{messages}</table>" if messages else "<p class='muted'>None.</p>"}"""
+{f"<table><tr><th>From</th><th>Subject</th><th>Added</th><th></th></tr>{messages}</table>" if messages else "<p class='muted'>None.</p>"}
+<h2>Trusted trims · {len(exc['trust_trims'])}</h2>
+<p class="hint">Senders whose keep-last-N extras are confirmed as junk (and deleted on schedule) even when they
+look personal, say because you once wrote to them. Add one with <b>Trust this sender's trims</b> in Quarantine.</p>
+{f"<table><tr><th>Sender</th><th>Added</th><th>Note</th><th></th></tr>{trusted}</table>" if trusted else "<p class='muted'>None.</p>"}"""
         return self.page("Exceptions", body, cfg, "exceptions", query)
 
     def post_exceptions(self, cfg, form):
@@ -554,7 +576,7 @@ class App:
                 msg = f"Keeping {sender}."
             elif action == "remove":
                 kind, key = (form.get("kind") or [""])[0], (form.get("key") or [""])[0]
-                if kind not in ("senders", "messages") or not exceptions.remove(exc, kind, key):
+                if kind not in ("senders", "messages", "trust_trims") or not exceptions.remove(exc, kind, key):
                     return redirect(base, "Not found.", bad=True)
                 msg = "Removed."
             else:
@@ -840,7 +862,7 @@ header / Subject, ignoring case; a rule with both needs both. Change the number 
         body = (f"<table>{rows}</table><p class='hint'>Purge stays on the command line: "
                 f"<code>imapsanity{' --account ' + h(cfg.name) if cfg.name else ''} purge --older-than 30</code>. "
                 f"It only deletes messages you confirmed as junk in Quarantine"
-                + (f" (keep-last-N trims count as confirmed; cycle already deletes them after "
+                + (f" (the scheduled cycle already deletes those, and keep-last-N trims, after "
                    f"{cfg.safety.purge_rule_trims_days:g} day(s))" if cfg.safety.purge_rule_trims_days else "")
                 + ".</p>")
         return self.page("Actions", body, cfg, "actions", query)

@@ -102,7 +102,7 @@ def cmd_sync(cfg, idx, args):
 
 
 def cmd_cycle(cfg, idx, args):
-    """Unattended run (launchd): pull, rules-only plan, apply, purge old keep-last-N trims (if
+    """Unattended run (launchd): pull, rules-only plan, apply, purge old confirmed junk (if
     [safety].purge_rule_trims_days is set), push, pull.
 
     Its plans are saved as cycle-*.json so they never shadow the manual plan that
@@ -138,7 +138,7 @@ def cmd_cycle(cfg, idx, args):
     idx.set_meta("cycle_backlog_scale", str(scale if aborted else 1))
     purged = 0
     try:
-        purged = quarantine.purge_rule_trims(cfg, idx)
+        purged = quarantine.auto_purge(cfg, idx)
     except (BackendError, OSError) as e:
         print(f"purge: {e}")
         rc = rc or 1

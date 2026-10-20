@@ -11,7 +11,8 @@ from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from unittest import mock
 
-from imapsanity import ai, apply, cli, guards, journal, maildir, plan, quarantine, rules, shadow, sync, typesafe
+from imapsanity import (ai, apply, cli, exceptions, guards, journal, maildir, plan, quarantine, rules, shadow, sync,
+                        typesafe)
 from imapsanity.backends.imap import ImapBackend
 from imapsanity.config import ConfigError, load, load_all
 from imapsanity.index import Index
@@ -591,21 +592,35 @@ class TestQuarantineReview(QuarantineHelpers, ImapFixture, Base):
 
         # Off by default: nothing is confirmed or deleted without you.
         self.assertFalse(any(i["confirmed"] for i in quarantine.items(self.cfg, self.idx)))
-        self.assertEqual(quarantine.purge_rule_trims(self.cfg, self.idx, out=quiet), 0)
+        self.assertEqual(quarantine.auto_purge(self.cfg, self.idx, out=quiet), 0)
 
         # On: only the trim with no strong signal counts as junk, not the AI's pick or the correspondent's.
         self.cfg.safety.purge_rule_trims_days = 7
         items = {i["msgid"]: i for i in quarantine.items(self.cfg, self.idx)}
         self.assertEqual({m for m, i in items.items() if i["confirmed"]}, {trimmed})
         self.assertEqual(quarantine.purgeable(self.cfg, self.idx), {trimmed})
-        self.assertEqual(quarantine.purge_rule_trims(self.cfg, self.idx, out=quiet), 0)   # too new
+        self.assertEqual(quarantine.auto_purge(self.cfg, self.idx, out=quiet), 0)   # too new
         self.assertEqual(len(self.conn.boxes["INBOX.Quarantine"]), 3)
 
         later = time.time() + 8 * 86400
         with mock.patch("imapsanity.apply.time.time", return_value=later):
-            self.assertEqual(quarantine.purge_rule_trims(self.cfg, self.idx, out=quiet), 1)
+            self.assertEqual(quarantine.auto_purge(self.cfg, self.idx, out=quiet), 1)
         self.assertEqual({m for m, _ in self.conn.boxes["INBOX.Quarantine"].values()}, {friend, pitch})
-        self.assertTrue(any(r.endswith("-purge-trims") for r in journal.all_runs(self.cfg)))
+        self.assertTrue(any(r.endswith("-autopurge") for r in journal.all_runs(self.cfg)))
+
+        # What you confirm by hand goes on the same schedule; so do trims from a sender you trust,
+        # even one you've written to. The AI's unconfirmed pick still waits.
+        self.idx.confirm_junk([pitch])
+        self.assertEqual(quarantine.purgeable(self.cfg, self.idx), {pitch})
+        exc = exceptions.load(self.cfg.state_dir)
+        exceptions.trust_trims(exc, "Friend@pal.com")
+        exceptions.save(self.cfg.state_dir, exc)
+        cfg = self.env.cfg()
+        cfg.safety.purge_rule_trims_days = 7
+        self.assertEqual({i["msgid"] for i in quarantine.items(cfg, self.idx) if i["auto"]}, {friend})
+        with mock.patch("imapsanity.apply.time.time", return_value=later):
+            self.assertEqual(quarantine.auto_purge(cfg, self.idx, out=quiet), 2)
+        self.assertEqual(len(self.conn.boxes["INBOX.Quarantine"]), 0)
 
     def test_rescue_keeps_message_out_of_quarantine(self):
         old = self.put("INBOX", "sale@deals.com", "old", days_ago=3)

@@ -7,8 +7,9 @@ quarantine into three tiers so the handful worth a careful look aren't buried in
   careful  a strong signal: you've written to the sender, or TypeSafe thinks it's personal/important
   glance   the AI's judgment, nothing strong (weak signals, e.g. not a mailing list, sort these)
   rules    extras trimmed by your own keep-last-N rules, nothing strong
-With [safety].purge_rule_trims_days set, the "rules" tier needs no review: it counts as confirmed
-junk and cycle deletes it that many days after quarantining it, as keep-last-N always meant.
+With [safety].purge_rule_trims_days set, cycle deletes confirmed junk that many days after
+quarantining it, and the "rules" tier needs no review: it counts as confirmed, as keep-last-N always
+meant. So do trims from senders you trust (exceptions "trust_trims"), whatever their signals.
 """
 
 import email.parser
@@ -101,9 +102,10 @@ def items(cfg, idx):
 
 
 def auto_junk(cfg, item):
-    """A keep-last-N trim with no strong signal, while [safety].purge_rule_trims_days is on."""
+    """A keep-last-N trim with no strong signal, or from a sender whose trims you trust, while
+    [safety].purge_rule_trims_days is on."""
     return bool(cfg.safety.purge_rule_trims_days) and item["ours"] and item["source"] == "rule" \
-        and tier(item) == "rules"
+        and (tier(item) == "rules" or item["addr"].lower() in cfg.exceptions["trust_trims"])
 
 
 def purgeable(cfg, idx):
@@ -111,18 +113,18 @@ def purgeable(cfg, idx):
     return idx.confirmed_junk() | {i["msgid"] for i in items(cfg, idx) if i["auto"]}
 
 
-def purge_rule_trims(cfg, idx, out=print):
-    """cycle: permanently delete keep-last-N trims quarantined more than purge_rule_trims_days ago.
-    Returns how many were deleted."""
+def auto_purge(cfg, idx, out=print):
+    """cycle: permanently delete confirmed junk (yours, and keep-last-N trims) quarantined more than
+    purge_rule_trims_days ago. Returns how many were deleted."""
     days = cfg.safety.purge_rule_trims_days
     if not days:
         return 0
-    auto = {i["msgid"] for i in items(cfg, idx) if i["auto"]}
-    cands = [e for e in apply.purge_candidates(cfg, days) if e["msgid"] in auto]
+    junk = {i["msgid"] for i in items(cfg, idx) if i["confirmed"]}
+    cands = [e for e in apply.purge_candidates(cfg, days) if e["msgid"] in junk]
     if not cands:
         return 0
-    tally = apply.delete_quarantined(cfg, cands, kind="purge-trims")
-    out(f"purge: keep-last-N trims quarantined over {days:g} day(s) ago: "
+    tally = apply.delete_quarantined(cfg, cands, kind="autopurge")
+    out(f"purge: confirmed junk quarantined over {days:g} day(s) ago: "
         + ", ".join(f"{k} {n}" for k, n in tally.items()))
     return tally.get("purged", 0)
 

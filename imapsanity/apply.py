@@ -141,7 +141,7 @@ def delete_quarantined(cfg, cands, kind="purge"):
 
 def purge(cfg, days, execute, inp=input, out=print, confirmed=None):
     """Permanently delete messages *we* quarantined at least `days` ago. Human-only (cycle's
-    automatic purge of keep-last-N trims is quarantine.purge_rule_trims).
+    automatic purge of confirmed junk is quarantine.auto_purge).
 
     `confirmed`: Message-IDs you confirmed as junk in the dashboard; when given, only those are
     deleted, so nothing you never looked at disappears. None deletes everything old enough.
