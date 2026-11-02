@@ -132,6 +132,13 @@ carries over while cycles keep aborting, so a backlog bigger than one run still 
 never raises the scale, so a runaway rule on a normal schedule still stops at the normal caps. The
 shadow/live AI step runs even when the rules step aborts.
 
+A backlog bigger than even the scaled caps (e.g. the server timed out for a day, so the gap never
+registered as missed cycles) aborts every cycle and only grows. So after `stall_alert_after` cycles in a row
+that sort nothing (a rules abort, a failed mbsync pull, or a failed push), cycle logs a `STALLED:` line with
+the command to fix it and posts a macOS notification, repeats it every `stall_alert_every` stalled cycles,
+and posts once more when a cycle runs clean. To clear an abort, review the latest `cycle-*.json` plan and
+apply it with the overrides the ABORT lines name.
+
 Use a LaunchAgent, not cron: cron jobs on macOS can't read the login Keychain, so the IMAP password lookup
 (and mbsync's `PassCmd`) fails. `~/Library/LaunchAgents/com.franzone.imapsanity.plist`:
 ```xml

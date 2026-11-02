@@ -10,7 +10,7 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
 
-from . import ai, apply, guards, journal, plan, quarantine, rules, shadow, sync, typesafe
+from . import ai, apply, guards, journal, plan, quarantine, rules, shadow, stall, sync, typesafe
 from .backends import BackendError
 from .backends.imap import ImapBackend
 from .config import ConfigError, load_all, pick
@@ -125,15 +125,29 @@ def cmd_cycle(cfg, idx, args):
 
     rc = sync.pull(cfg, idx, True)
     if rc:
+        stall.record(cfg, idx, f"mbsync pull failed (exit {rc})")
         return rc
     actions, _ = rules.build_actions(cfg, idx)
     aborted = False
+    stalled = hint = None
     if not actions:
         print("cycle: no rule matches")
     else:
         path = plan.save(cfg, plan.new_plan(actions), prefix="cycle")
-        rc = apply.apply_plan(cfg, idx, path, True, max_moves, max_fraction, max_quarantine)
+        lines = []
+
+        def out(line):
+            lines.append(line)
+            print(line)
+        rc = apply.apply_plan(cfg, idx, path, True, max_moves, max_fraction, max_quarantine, out=out)
         aborted = rc == 2
+        if aborted:
+            limits = [ln.strip(" -") for ln in lines if ln.startswith("  - ")]
+            first = limits[0].split(" (override")[0] if limits else "see cron.log"
+            stalled = f"rules aborted, {first}" + (f" (+{len(limits) - 1} more)" if len(limits) > 1 else "")
+            acct = f"--account {cfg.name} " if cfg.name else ""
+            hint = (f"review `imapsanity {acct}show {path}`, then `imapsanity {acct}apply {path} --execute` "
+                    "with the overrides named above")
     # An abort keeps the scale this backlog earned, for the next cycle; anything else clears it.
     idx.set_meta("cycle_backlog_scale", str(scale if aborted else 1))
     purged = 0
@@ -144,9 +158,14 @@ def cmd_cycle(cfg, idx, args):
         rc = rc or 1
     if not aborted:
         if cfg.maildir_folders:
-            rc = sync.push(cfg, True) or rc
+            prc = sync.push(cfg, True)
+            if prc:
+                stalled = f"push failed (exit {prc}); moves are pending locally"
+                hint = "check the cron.log lines above (circuit breaker or mbsync), then `imapsanity sync push --execute`"
+            rc = prc or rc
         if actions or cfg.maildir_folders or purged:
             rc = sync.pull(cfg, idx, True) or rc
+    stall.record(cfg, idx, stalled, hint)
     # The AI step runs even when the rules step aborted, so a blocked backlog doesn't stall it.
     if cfg.auto.mode in ("shadow", "live"):
         rows = shadow.run(cfg, idx)
