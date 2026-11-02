@@ -38,6 +38,8 @@ class Safety:
     cycle_interval_minutes: float = 15   # launchd StartInterval; a longer gap scales cycle's limits
     max_backlog_scale: float = 5         # cap on that scale
     max_backlog_fraction: float = 0.5    # cap on max_fraction_per_folder after scaling
+    stall_alert_after: int = 4           # cycles in a row that sort nothing (abort/sync fail) before a notification; 0: off
+    stall_alert_every: int = 24          # then repeat every this many stalled cycles
     skip_flagged: bool = True
     protected_folders: list = field(default_factory=lambda: [
         "Sent", "Sent Messages", "Drafts", "Templates", "Trash", "Deleted Messages"])

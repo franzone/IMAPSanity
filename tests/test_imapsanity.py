@@ -487,6 +487,42 @@ class TestApplyUndoPurge(ImapFixture, Base):
         self.assertEqual(len(self.conn.boxes["INBOX"]), 0)
         self.assertEqual(self.idx.get_meta("cycle_backlog_scale"), "1")
 
+    def test_cycle_alerts_after_repeated_aborts_and_on_recovery(self):
+        from imapsanity import cli, stall
+        self.cfg.safety.max_moves_per_run = 1
+        self.cfg.safety.min_folder_size_for_fraction = 1000
+        self.cfg.safety.stall_alert_after, self.cfg.safety.stall_alert_every = 2, 3
+        for days in (0, 1, 2):
+            self.seed("INBOX", "sale@deals.com", f"x{days}", days_ago=days)
+        printed = []
+        with mock.patch.object(stall, "_notify") as notify, \
+                mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            for _ in range(4):
+                self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 2)
+            self.assertEqual(notify.call_count, 1)                 # at stall 2; stall 5 would repeat it
+            self.assertIn("rules aborted, 3 moves exceeds max_moves_per_run=1", notify.call_args[0][1])
+            self.assertTrue(any(p.startswith("STALLED:") for p in printed))
+            self.assertTrue(any("--execute" in p for p in printed if p.startswith("  fix:")))
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 2)
+            self.assertEqual(notify.call_count, 2)
+            self.cfg.safety.max_moves_per_run = 3
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 0)
+            self.assertEqual(notify.call_count, 3)
+            self.assertIn("Sorting again after 5", notify.call_args[0][1])
+            self.assertEqual(cli.cmd_cycle(self.cfg, self.idx, None), 0)   # clean again: no more alerts
+            self.assertEqual(notify.call_count, 3)
+        self.assertEqual(self.idx.get_meta("cycle_stall_count"), "0")
+
+    def test_cycle_counts_failed_pull_as_stall(self):
+        from imapsanity import cli, stall
+        self.cfg.safety.stall_alert_after = 2
+        with mock.patch.object(stall, "_notify") as notify, mock.patch("builtins.print"), \
+                mock.patch("imapsanity.sync.pull", return_value=1):
+            cli.cmd_cycle(self.cfg, self.idx, None)
+            cli.cmd_cycle(self.cfg, self.idx, None)
+        self.assertEqual(notify.call_count, 1)
+        self.assertIn("mbsync pull failed", notify.call_args[0][1])
+
     def test_unapproved_ai_actions_not_applied(self):
         self.seed("INBOX", "news@letters.com", "issue 5")
         self.idx.update(verbose=False)
